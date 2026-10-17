@@ -156,6 +156,173 @@ Each queued run captures its command and working directory at settlement. Config
 
 This coordinates one extension instance's foreground commands with its Agent. It does not lock the workspace against other Sessions, Subagents, external editors, user shell commands, or detached descendants. Pi's command cancellation does not guarantee termination of an entire process tree; keep all command writes in the foreground and inspect interrupted work before relying on its files.
 
+## pi config checkboxes: self-contained sets
+
+`pi config` shows OpenPI as a flat list of resources to tick. The list shows what exists, not what depends on what, and excluding the wrong entry takes its tools with it without an error. This section projects that flat list onto the capability groups the runtime already defines, so the loading boundary is visible before the first run instead of at the first missing tool. Set names reuse the runtime's own `OPENPI_CAPABILITY_GROUPS` and intent vocabulary; no second naming system is introduced.
+
+Resolved in this checkout at OpenPI 0.10.0 (`78dc574`) the list is **35 extensions, 4 skills, and 1 theme**. Treat that as a resolution result, not a fixed property: the extension entries are whatever `extensions/*/index.ts` matches under the `pi.extensions: ["./extensions"]` manifest (`package.json:48`), and the skill entries are the package's `skills/*/SKILL.md` files plus any workspace-local skill (here `.agents/skills/test-value`). The tables below are a projection of these runtime definitions; a change to the extension list changes the projection, not the method.
+
+### What a checkbox actually controls
+
+Filtering is load-time inclusion, not dependency resolution. Pi loads exactly the entry files a filter allows, and excluding one entry does not remove its sibling modules, so a surviving extension that imports across directories still resolves.
+
+Measured on 0.10.0 at `78dc574`: **45 filter combinations** — single-extension exclusions, directory-granularity exclusions, skill/theme exclusions, and near-empty sets. Of those, 29 were resolved through Pi's package manager and resource loader, 39 were started through `pi --mode rpc`, 23 did both, and the remaining 16 saw only the rpc path. Every run exited 0 with empty stderr, and all 29 loader runs reported **zero extension errors**. They are not 29 independent results: several configurations coincide, and the 29 collapse to **22 distinct load outcomes**.
+
+One of those coincidences is the more useful finding. The three directory-granularity exclusions (`!extensions/file-search` and friends) excluded **nothing**: each still resolved 35 extensions, byte-identical to the unfiltered baseline, because the manifest globs `extensions/*/index.ts` while a directory-level negation matches no entry. An exclusion that reads as valid and silently keeps the extension is the failure mode this section is about, so treat "the filter looks right" as unverified until the resolved count moves.
+
+`git-read` keeps working when a *single-entry* exclusion removes `extensions/file-search/index.ts`, because it still resolves `../file-search/src/output.ts` (`extensions/git-read/index.ts:23`) — the filter removed the entry, not the module.
+
+The practical consequence is the opposite of a safety net: **excluding the wrong set fails silently.** A capability group whose owner was excluded simply never produces its tools. The loader reports no error and no diagnostic for this (`loader.getExtensions()`, `getSkills()`, and `getThemes()` all keep empty `errors`/`warnings`/`diagnostics` lists), and nothing on stderr announces it.
+
+There is one runtime signal, and it is easy to misread. An explicit gateway request for a group whose owner is absent returns an empty activation set — `activatedTools: []` with the text `Activated tools: none yet.` (`extensions/capabilities/index.ts:201-204`, the `none yet` fallback at `:203`). That wording reads like deferred activation, so "none yet" can be mistaken for "not yet, try again" when it means "never, in this configuration". The same call still advertises the capability's skill file (`:73`, via `skillGuidance`), which points at guidance whose tools are not mounted. So: no startup error, no loader diagnostic, and a gateway reply that only distinguishes the two cases if you read `activatedTools` rather than the sentence.
+
+Registered and active are also separate layers, which is why a checkbox can look inert. A session that has loaded nothing still registers the OpenPI tool definitions; what the gate decides is which of them are projected into the active surface. In the default `explicit` configuration none of the capability-owned tools are active, and the gateway itself is not active either — it appears only after an explicit request (`extensions/capabilities/index.ts:168`) or under `adaptive` discovery (`:111-119`). With `capabilities` excluded, the gateway is not merely inactive: **its registration is gone too**, because the extension that registers the classifier and the gateway is the one that was unticked. That is the mechanical reason the loss is silent rather than reported.
+
+### npm dependencies do not track the checkboxes
+
+**A checkbox is a loading boundary, not an installation boundary.** OpenPI declares its runtime dependencies unconditionally in `package.json`, and the `pi` manifest carries only resource paths — `extensions`, `themes`, and `image` (`package.json:47-55`) — so there is no per-resource dependency declaration for a filter to act on. In this checkout those dependencies are seven, and they are concentrated rather than distributed per set: `effect` reaches `ask-user`, `background-terminals`, `file-search`, `git-info`, `git-read`, `subagents`, and `suggestions`; `@effect/platform-node` reaches `file-search`, `git-info`, and `git-read`; `acorn` reaches only `workflows`; `undici` and `node-pty` are used under `web/` and `jiti` by the `bin/` entry point; `@effect/platform-node-shared` is declared with no production import outside `tests/`.
+
+Consequently unticking `workflows` still installs `acorn`, and unticking every `effect`-based extension still installs `effect`. There is no per-set npm dependency to satisfy — and no dependency pruning either. The Pi packages (`@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui`) and `typebox` are peer dependencies supplied by the host, so they do not vary with tick state at all.
+
+### Choosing by intent
+
+The sets exist so the choice can be made from intent rather than from a dependency table. The runtime already classifies the same intents at `extensions/shared/capability-intent.ts:7`; asking for a capability in these terms is what loads it. Read this table first; the reference tables below exist to justify it, not to be memorized.
+
+| Your intent | What to tick | What that means in practice |
+| --- | --- | --- |
+| Ordinary editing, no delegation | nothing beyond the defaults | The default surface is native Pi tools only. Mentioning `fd`, `rg`, a delegation, a workflow, or a session goal loads that group on demand. |
+| Investigate read-only before changing anything | defaults; keep `capabilities`, `plan-mode`, and the `search` owners (`file-search`, `git-read`) | Plan Mode lights `search` on its own (`extensions/plan-mode/index.ts:224`), but it can only project `fd`/`rg`/`git_*` if the owner that defines them was loaded. |
+| Delegate independent work in parallel | defaults; keep `capabilities` and `subagents` | Either a name mention (`subagent`) or a delegation request lights `delegate`. |
+| Long-running servers and watchers | defaults; keep `capabilities` and `background-terminals` | `bg_start` appears on intent; the rest of the family follows once a background resource exists. |
+| Workflow orchestration | defaults; keep `capabilities` and `workflows` | A name mention (`workflow`) lights the group; `subagents` is not required. |
+| Never want delegation to be possible | `capabilities`, `search`, `background`, `session`, `runtime` | Untick `subagents` and `workflows`. Nothing errors; `delegate` and `workflow` simply stay empty. |
+| Keep a review session close to read-only | `capabilities`, `search`, `subagents`, `plan-mode` | Untick `workflows` and `background-terminals` so no multi-stage run and no background process can start, and untick `post-edit` so no command runs after a write. This is not a read-only guarantee: `setup` can still write configuration during an admitted setup episode, and `tasks`/`goal` can still write session state. |
+
+Nothing here requires unticking anything: the default is already the zero-resident-tool configuration, and a set only becomes reachable when the user asks for it or opts into `adaptive` discovery. The two "untick" rows are the only ones where the choice is subtractive, and both are the kind of thing to decide before the first run rather than in reaction to one.
+
+### Silent degradation: things that look fine and are not
+
+Every one of these combinations loads without error and quietly loses capability:
+
+| Combination | What silently disappears | Evidence |
+| --- | --- | --- |
+| Exclude `capabilities` | **All six sets stop activating.** Every prompt returns zero activated tools | activation harness + real session (gateway absent, `activatedTools: []`), 0 errors |
+| Exclude `subagents` | `delegate` activates nothing; a delegate request is ignored | activation harness; real session confirms `[]` |
+| Exclude `workflows` | `workflow` activates nothing; a workflow request is ignored | activation harness; real session confirms `[]` |
+| Exclude `background-terminals` | `background` activates nothing | activation harness |
+| Exclude `runtime-snapshot` | `runtime` is unreachable. `openpi_load_tools` still lists the group and its summary, because the group is defined independently of its owner, but loading it activates nothing and the tool never appears | gateway probe (real session): listing present, `activatedTools: []` |
+| Exclude an owner but keep the skill | The skill file still loads and is still advertised in gateway guidance; the tools it describes do not | loader probe (skills); gateway probe (guidance) |
+
+`capabilities` is the load-bearing entry. It owns the intent classifier (`extensions/shared/capability-intent.ts`) and the gateway tool, and it is the only extension that turns a prompt into a group load (`extensions/capabilities/index.ts:168` for prompt intent, `:190` for the gateway). Excluding it leaves every other loaded extension in place but completely inert with respect to capability discovery.
+
+### The six self-contained sets
+
+All six are the runtime's existing `OPENPI_CAPABILITY_GROUPS`, key for key (`extensions/shared/tool-surface.ts:76-108`). Names are reused deliberately; nothing here is a renamed set.
+
+| Set | Owner extension(s), with its source-map line | Tools it activates | How it lights |
+| --- | --- | --- | --- |
+| `search` | `file-search` (`extensions/shared/tool-surface.ts:154-156`), `git-read` (`:157`) | `fd`, `rg`, `git_show`, `git_diff`, `git_log` | prompt intent, `openpi_load_tools`, or Plan Mode |
+| `delegate` | `subagents` (`extensions/shared/tool-surface.ts:158`) | `subagent_spawn`, `subagent_wait`, `subagent_cancel`, `subagent_send`, `subagent_check`, `subagent_list` | name mention, delegation intent, or `openpi_load_tools` |
+| `workflow` | `workflows` (`extensions/shared/tool-surface.ts:159`) | `workflow`, `workflow_stop`, `workflow_status` | name mention or `openpi_load_tools` |
+| `background` | `background-terminals` (`extensions/shared/tool-surface.ts:160-162`) | `bg_start` first; `bg_status`, `bg_list`, `bg_kill`, `bg_watch` after a resource exists | prompt intent or `openpi_load_tools` |
+| `session` | `tasks` (`extensions/shared/tool-surface.ts:163`), `goal` (`:164`) | `tasks_add` and `create_goal` first; `tasks_update`, `tasks_list`, `get_goal`, `update_goal` after a resource exists | prompt intent, `openpi_load_tools`, or a Goal lifecycle transition |
+| `runtime` | `runtime-snapshot` (`extensions/shared/tool-surface.ts:151-153`) | `runtime_snapshot` | gateway only; absent from the prompt-intent map |
+
+Each set is self-contained in the sense that ticking its owner(s) **and keeping `capabilities`** yields a working whole: the tools exist, their state lives in the owning extension, and no *other set* has to be ticked first. `capabilities` is not one of the six; it is the shared hard prerequisite for all of them, and it is ticked by default. Ticking an owner while unticking `capabilities` is not a degraded set, it is a dead one — the classifier and the gateway are gone, so nothing can load the group (§ "Silent degradation" below).
+
+The two sets with more than one owner — `search` and `session` — are also the two where a *partial* tick is meaningful rather than broken, because their owners are independent of each other.
+
+### Partial ticks that still work
+
+`search` and `session` are unions, and either half alone is a usable set:
+
+| Tick | Result | Evidence |
+| --- | --- | --- |
+| `file-search` without `git-read` | `search` still activates `git_show`/`git_diff`/`git_log` | activation harness; real session agrees |
+| `git-read` without `file-search` | `search` still activates `fd` and `rg` | activation harness; real session agrees |
+| `tasks` without `goal` | `session` activates `create_goal` only (the `tasks` half is gone) | activation harness |
+| `goal` without `tasks` | `session` activates `tasks_add` only (the `goal` half is gone) | activation harness |
+| `workflows` without `subagents` | `workflow`'s tool set is unchanged | real session (identical `workflow`/`workflow_stop`/`workflow_status`) |
+
+`workflows` is the case most likely to be misjudged from the source alone. It imports `loadAgentTypes` from `../subagents/src/agent-types.ts` (`extensions/workflows/index.ts:93`) and ships its own runner that calls `createAgentSession` directly (`extensions/workflows/runner.ts:328`). **Dropping `subagents` does not shrink `workflow`'s tool set** — delegate and workflow are independent at the checkbox, despite the visible import line.
+
+What that does *not* establish is runtime equivalence. The measurement covers which tools are active; no workflow was actually executed, because that needs a provider. `workflows` also reads `loadSetupConfig().subagents.roleModels` (`extensions/workflows/index.ts:1833`) and resolves agent types itself (`:990`, `:1194`), so the honest claim is "activation-independent, run-time equivalence not exercised".
+
+### Two narrow side doors
+
+The general gate is `capabilities`, but two extensions can light one group each from a lifecycle trigger rather than from a prompt. These are real, narrow exceptions:
+
+- **Plan Mode lights `search`** — `if (planning) loadOpenPiCapabilities(pi, ["search"])` (`extensions/plan-mode/index.ts:224`). Measured with `capabilities` absent: entering Plan Mode moves loaded capabilities from `[]` to `["search"]`, and the real session shows `fd`, `rg`, `git_show`, `git_diff`, `git_log`, and `plan_ready` becoming active.
+- **The Goal lifecycle lights `session`** — `loadOpenPiCapabilities(pi, ["session"])` (`extensions/goal/index.ts:105`), called through `showLifecycleTools` from goal creation (`:145-153`), resume (`:344-346`), session start and tree restore while a goal is active (`:417`, `:452`), and the continuation path (`:442-445`). Reproduced through both doors a user actually has: the `create_goal` tool and the `/goal <objective>` command each move loaded capabilities from `[]` to `["session"]` with `capabilities` absent.
+
+These two are the *only* places outside `capabilities` that call `loadOpenPiCapabilities`: a search over the extension sources finds those two call sites and the two inside `capabilities/index.ts` (`:168`, `:190`) and nothing else. So excluding `capabilities` while keeping `plan-mode` and `file-search` still leaves one working entry point — `search`, and only while Plan Mode is armed; keep `goal` as well and there are two, with `session` reachable from the Goal lifecycle alone. Either way this is a legitimate narrow seam, not a recovery path: each door restores one group for one mode or one lifecycle, never capability discovery as a whole.
+
+### Sets that need no tick reasoning
+
+The table above is complete: it is exactly the `OPENPI_OWNER_SOURCE_PATHS` entries that no capability group lists as an owner (`extensions/shared/tool-surface.ts:147`), checked against `:76`. These owners are never gated by whether a set was loaded; each has its own narrower state gate instead:
+
+| Owner | Tools | Its own gate |
+| --- | --- | --- |
+| `capabilities` | `openpi_load_tools` | explicit gateway request, or `adaptive` discovery |
+| `interaction` | `ask_user`, `human_handoff` | Plan Mode, or an active setup episode |
+| `plan` | `plan_ready` | Plan Mode armed and no ready plan yet |
+| `setup` | `configure_my_pi_setup` | an admitted setup episode only |
+| `context` | `context_pivot` | context above the pivot threshold |
+| `browser` | `openpi_browser` | `browser.control` in package configuration |
+
+Every remaining entry directory (the `extensions/*/index.ts` matches that no owner path points at) is outside this table and **owns no capability group**, so unticking one cannot empty a set. That is a statement about capability ownership, not about whether a tool is ever registered: `file-mutation-display` is the one such extension that calls `pi.registerTool`, re-registering native `bash`/`write`/`edit`/`read`/`grep`/`find`/`ls` definitions — but only on a host without `registerToolRenderer`, after an early return at `extensions/file-mutation-display/index.ts:74` (`modern` is decided at `:47`); on a modern host it installs a renderer and returns. The rest render, schedule, or observe (for example `ui-customization`, `turn-time`, `usage`, `web-search`, `workspace-cleanup-guard`). Unticking any of them changes presentation or ambient behavior, never the capability sets.
+
+### Verification matrix
+
+Every set, its dependency claim, and the evidence behind it:
+
+| Set | Check | Evidence | Conclusion |
+| --- | --- | --- | --- |
+| `search` | owner extensions | `extensions/shared/tool-surface.ts:76-108` (group keys and owners) | verified (source) |
+| `search` | `file-search` and `git-read` are independently sufficient | activation harness (both drop cases); 7 related exclusion combinations, all exit 0 through the loader | verified (fake harness) |
+| `delegate` | `subagents` is the sole owner | activation harness, drop:subagents empty | verified (fake harness) |
+| `delegate` | lights on a name mention, not only on a delegation request | `extensions/shared/capability-intent.ts:33` maps `subagents?` → `delegate` | verified (source) |
+| `delegate` | has no cross-owner hard requirement | no import edges to `subagents` outside `workflows`/`shared` | verified (source) |
+| `workflow` | `workflow`'s tool set is unchanged by dropping `subagents` | real session: identical tool set (`workflow`, `workflow_stop`, `workflow_status`), 0 extension errors both ways | verified (real session) |
+| `workflow` | imports `subagents/src/agent-types.ts` but not its runtime | `extensions/workflows/index.ts:93`, `extensions/workflows/runner.ts:328` | verified (source) |
+| `background` | deferred tools appear only after a resource exists | tool surface `entry`/`deferred` split | verified (source) |
+| `session` | `tasks` and `goal` are independently sufficient | activation harness, both drop cases | verified (fake harness) |
+| `session` | Goal can light the group without `capabilities` | `extensions/goal/index.ts:105`, reached from `:145-153`, `:344-346`, `:417`, `:442-445`, `:452`; real session `[]` → `["create_goal","tasks_add","get_goal","update_goal"]` | verified (real session) |
+| `runtime` | gateway only, absent from the prompt-intent map | `extensions/shared/capability-intent.ts:6` (comment) and `:7` (`Partial<Record<OpenPiCapability, RegExp>>` omits it) | verified (source) |
+| `capabilities` | excluding it zeroes every set, silently | activation harness, 0 errors | verified (fake harness) |
+| `capabilities` | excluding it removes the gateway's registration, not just its projection | real session: registered before, absent after | verified (real session) |
+| `plan-mode` | lights `search` with `capabilities` absent | real session driving `/plan`: `[]` → `["fd","rg","git_show","git_diff","git_log"]` | verified (real session) |
+| all | filtered combinations never error | 45 combinations (29 loader runs, 39 rpc runs, 23 both); every exit 0, every stderr empty, 29 loader runs with 0 extension errors; 22 distinct outcomes | verified (runtime-resolver) |
+| — | `pi config` writes an entry-level package filter, and that shape excludes | shape from `config-selector.js` `getPackageResourcePattern` (relative entry path with `+`/`-`); driven through Pi's resolver: 34/35 with one unticked, 33/35 with two, 0 errors | verified (runtime-resolver) |
+| all | cross-directory imports survive an entry exclusion | `git-read` without the `file-search` entry, via the loader | verified (runtime-resolver) |
+| skills | unticking a skill does not remove its tools | `skills/*/SKILL.md` are guidance files and tool registration lives in `extensions/*/index.ts`, so the two are independent by construction (source); the loader probe confirms the skill list shrinks without any extension error (run). No tool-level observation was made | verified (runtime-resolver) |
+| npm | tick state does not change what is installed | `package.json:47-55` (manifest has no dependency field), `:56-64` (unconditional dependencies) | verified (source) |
+| — | real `pi config` TUI interaction | no TTY in the measurement environment | **not verified** |
+| — | model-level behavior under a live provider | no provider invoked | **not verified** |
+
+### Re-deriving these tables
+
+The tables above are a projection of runtime facts, not a second source of truth. Two claims are worth re-checking whenever the extension list changes, because both are invisible to a plain source read:
+
+1. **The set list.** `OPENPI_CAPABILITY_GROUPS` at `extensions/shared/tool-surface.ts:76` and the tool ownership map at `:11` are the authority. A new capability group appears there first, and a new `OPENPI_OWNER_SOURCE_PATHS` entry (`:147`) is required before any extension can own it.
+2. **The activation outcome.** Tick state is resolved by Pi's own package manager, and activation can be observed without a provider by resolving resources and then driving `before_agent_start`. The two conclusions most likely to invert are "which extension is the sole gate" and "which imports actually constrain the checkbox" — hence the `capabilities` and `workflows` rows. Re-run both against a real `createAgentSession` as well, because the activation harness fakes the session object and would not catch a difference that only the real loader produces.
+
+No separate generator or frozen fingerprint is introduced here, and that is a deliberate scope decision rather than an oversight. This section is a projection of the runtime's own definitions — `OPENPI_CAPABILITY_GROUPS` and `OPENPI_OWNER_SOURCE_PATHS` are the single source of truth — so a drift guard would guard a table that is already derived. What it would not do is catch a table that quotes the runtime correctly and reasons about it wrongly, which is the failure this section actually had; that is caught by re-measuring, not by a hash. Keeping the section free of build steps also keeps `SETUP.md` a document rather than a generated artifact that has to be regenerated before release.
+
+The anti-drift convention is therefore human and stated: treat any row as stale the moment the cited `file:line` stops matching, and re-measure rather than editing the conclusion in place. Automated fingerprint freezing and a shared schema with `check-docs-contract` were considered and left out of this change; the repository's machine-checked documentation contracts (`scripts/check-config-contract.mjs` for the 37 persisted configuration fields, `scripts/check-docs-contract.mjs` for `docs/decisions`) do not cover this section.
+
+The evidence column uses four levels of verified evidence, plus one that says so outright. Faked and real evidence are kept apart on purpose, because they do not measure the same code path:
+
+- **verified (source)** — the claim is fixed at the cited line. Nothing was executed.
+- **verified (runtime-resolver)** — Pi's own package manager and resource loader (`DefaultPackageManager.resolve`, `DefaultResourceLoader.reload`) resolved the entries. Real code, but it observes *loading*, not tool activation.
+- **verified (fake harness)** — a fresh-session activation harness drove `before_agent_start` and read the resulting active tool set, but against a **hand-written fake `ExtensionAPI`**, not a Pi session.
+- **verified (real session)** — a real `createAgentSession` with `DefaultResourceLoader(additionalExtensionPaths)`.
+- **not verified** — stated as a limitation, and never inferred to follow from green checks elsewhere.
+
+The fake harness is not a weaker version of the real one; it exercises a *different branch*. It never registers tools, so `getAllTools()` returns entries with no `sourceInfo`, which sends `extensions/shared/tool-surface.ts` down the "every tool lacks sourceInfo" fallback at `:277`. A real session reaches the `sourceInfo.path === expectedSource` branch at `:283-292`. It also starts from a fully-populated active set rather than an empty one, so "activated" there is a set difference against a non-default baseline. Treat the fake-harness rows as evidence about the entry/deferred mapping, not about real ownership resolution. Where a claim matters for a real session, it was re-run there.
+
+The two `not verified` rows are the honest boundary of this section. Tick state was never driven through the real `pi config` TUI, and no provider was ever called, so nothing here describes how a live model behaves once a set is loaded. The filter shape itself is no longer an assumption. `pi config`'s selector does not write this section's probe syntax; it writes an **entry-level relative path** with a `-`/`+` prefix. For a package resource the pattern is `relative(packageRoot, resourcePath)` (`dist/modes/interactive/components/config-selector.js`, `getPackageResourcePattern`), so unticking `subagents` appends `-extensions/subagents/index.ts` to that package's `extensions` array. Driving that exact shape through Pi's resolver confirms it works: the excluded entry drops out and the rest resolve cleanly (34 of 35, 0 errors), and unticking two appends two such lines (33 of 35). Prefixes are not interchangeable: `-extensions/subagents/index.ts` (the shape the TUI writes) and `!extensions/subagents/index.ts` both exclude the entry (34 of 35, 0 errors), while the directory form `!extensions/subagents` excludes nothing (35 of 35, identical to the baseline) and the additive `+extensions/subagents/index.ts` changes nothing because the package already declares it. So the no-op finding above is specifically about **directory-level** negation, not about negation in general. The remaining gap is only the keystroke path itself — no TTY was available to press the key — but the write shape, the string it produces, and that string's effect on resolution are all measured.
+
 ## Optional cross-session communication
 
 [pi-intercom](https://github.com/nicobailon/pi-intercom) is an independently maintained Pi package for communication between top-level Sessions. OpenPI does not detect, recommend, install, configure, migrate, or remove it. If you need that capability, review its repository and install it through Pi's native package command:

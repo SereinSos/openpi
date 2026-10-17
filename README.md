@@ -547,6 +547,18 @@ Footer 布局以 `footerLines` 作为唯一持久化格式。旧版 `footerItems
 
 </details>
 
+### 勾选项与自洽集合
+
+`pi config` 里的 OpenPI 条目是一张平铺清单，只说明存在什么，不说明谁依赖谁，而排除错误的一组会**静默失效**：这条通路没有启动错误，也没有 loader 诊断；唯一的运行时可观察信号是网关返回空 `activatedTools`，其「none yet」措辞容易被误读成延迟激活。运行时已经定义了能力分组（`extensions/shared/tool-surface.ts`），文档直接复用这套命名而不另起一套：`search` / `delegate` / `workflow` / `background` / `session` / `runtime`。本 checkout 在 0.10.0 上解析为 35 个 extension、4 个 skill、1 个 theme——这是解析结果，不是固定属性；换一份扩展列表，下面的方法与结论仍然成立，只有投影会变。
+
+三处最容易被源码误判的结论：
+
+- `workflows` 虽然 import 了 `subagents/src/agent-types.ts`，但它有自己的 runner（`extensions/workflows/runner.ts`），**排除 `subagents` 不会缩小 `workflow` 的工具集**（激活层面实测；真实 workflow run 未执行，运行时等价性未验证）；
+- **勾选不影响 npm 安装**：`package.json` 的 runtime 依赖是无条件声明的，Pi 的资源过滤只决定加载哪些入口文件。集合是**加载边界，不是安装边界**——去掉 `workflows` 照样装 `acorn`，反之也不会因此少装什么；
+- `capabilities` 是唯一的通用闸门，**排除它会让其余全部扩展对能力发现彻底惰性**，且不报任何错。它有两个窄侧门：Plan Mode 可以单独点亮 `search`（`extensions/plan-mode/index.ts:224`），Goal 生命周期可以单独点亮 `session`（`extensions/goal/index.ts:105`）。
+
+完整的集合定义、npm 依赖归属、可自由组合与会静默降级的组合、按意图选勾的对照表，以及「集合 × 检查项 × 证据 × 结论」的取证矩阵（集合与依赖边带 `file:line`，并附可复现的 harness 名与实测结论），见 [SETUP.md 的 pi config checkboxes: self-contained sets](SETUP.md#pi-config-checkboxes-self-contained-sets)。
+
 ### 安装要求与来源
 
 - Pi `0.99.1` 或更新版本；开发依赖与 CI 验证基线为 `1.2.0`；
