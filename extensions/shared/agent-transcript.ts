@@ -1,14 +1,17 @@
 /** Shared Pi-native operator-facing agent transcript rendering. */
 
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import {
   AssistantMessageComponent,
   getMarkdownTheme,
   UserMessageComponent,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { TruncatedText } from "@earendil-works/pi-tui";
-import type { AgentToolRenderer } from "./agent-tool-renderer.ts";
+import { Text, TruncatedText } from "@earendil-works/pi-tui";
+import type {
+  AgentMessagePresentation,
+  AgentToolRenderer,
+} from "./agent-tool-renderer.ts";
 import { sanitizeTerminalText } from "./terminal-text.ts";
 import {
   parseToolArgsPreview,
@@ -67,6 +70,22 @@ export interface AgentTranscriptDocument {
 }
 
 const MAX_CACHED_WIDTHS_PER_ITEM = 2;
+const MAX_EXPANDED_PREVIEW_CHARACTERS = 4096;
+const MAX_EXPANDED_PREVIEW_LINES = 24;
+
+/** Presentation-only bound; the source preview never becomes full evidence. */
+function boundedToolPreview(value: string) {
+  const points = Array.from(sanitizeText(value));
+  const text = points.slice(0, MAX_EXPANDED_PREVIEW_CHARACTERS).join("");
+  const lines = text.split("\n");
+  const truncated =
+    points.length > MAX_EXPANDED_PREVIEW_CHARACTERS ||
+    lines.length > MAX_EXPANDED_PREVIEW_LINES;
+  return (
+    lines.slice(0, MAX_EXPANDED_PREVIEW_LINES).join("\n") +
+    (truncated ? "\n[preview truncated]" : "")
+  );
+}
 
 /**
  * Strip raw ANSI codes, expand tabs, and drop control chars. Terminal-expanded
@@ -110,7 +129,7 @@ function assistantMessage(
         name: part.name,
         arguments:
           args !== null && typeof args === "object" && !Array.isArray(args)
-            ? args
+            ? (args as JsonObject)
             : {},
       };
     }),
@@ -125,21 +144,41 @@ function assistantMessage(
   };
 }
 
-function renderUserText(text: string, width: number) {
+function messageTheme(presentation?: AgentMessagePresentation) {
+  return {
+    ...getMarkdownTheme(),
+    ...(presentation ? { codeBlockIndent: presentation.codeBlockIndent } : {}),
+  };
+}
+
+function renderUserText(
+  text: string,
+  width: number,
+  presentation?: AgentMessagePresentation,
+) {
   const clean = sanitizeText(text).trim();
   if (!clean) return [];
-  return new UserMessageComponent(clean, getMarkdownTheme()).render(width);
+  return new UserMessageComponent(
+    clean,
+    messageTheme(presentation),
+    presentation?.outputPad,
+    presentation?.markdownTransformers,
+  ).render(width);
 }
 
 function renderAssistantParts(
   parts: ReadonlyArray<AgentTranscriptPart>,
   width: number,
   streaming = false,
+  presentation?: AgentMessagePresentation,
 ) {
   const component = new AssistantMessageComponent(
     assistantMessage(parts),
-    false,
-    getMarkdownTheme(),
+    presentation?.hideThinking ?? false,
+    messageTheme(presentation),
+    undefined,
+    presentation?.outputPad,
+    presentation?.markdownTransformers,
   );
   if (streaming) component.updateContent(assistantMessage(parts), true);
   return component.render(width);
@@ -172,7 +211,7 @@ function renderToolBlock(
   );
   if (native) return native;
   const { args, fallback } = parseToolArgsPreview(argsPreview);
-  return [
+  const lines = [
     "",
     renderPaddedToolActivityLine(
       {
@@ -188,6 +227,21 @@ function renderToolBlock(
       now,
     ),
   ];
+  if (expanded) {
+    // Historical adapters retain previews, not the original definition/result.
+    // Do not reconstruct a native tool (or a diff/exit code) from that text.
+    const details = [
+      "Bounded tool preview · native details unavailable",
+      argsPreview === undefined
+        ? "Arguments preview unavailable"
+        : `Arguments preview:\n${boundedToolPreview(argsPreview)}`,
+      outputPreview === undefined
+        ? "Output preview unavailable"
+        : `Output preview:\n${boundedToolPreview(outputPreview)}`,
+    ].join("\n");
+    lines.push(...new Text(theme.fg("dim", details), 1, 0).render(width));
+  }
+  return lines;
 }
 
 function renderAssistantItem(
@@ -200,7 +254,12 @@ function renderAssistantItem(
   toolRenderer?: AgentToolRenderer,
   expanded = false,
 ) {
-  const out = renderAssistantParts(item.parts, width);
+  const out = renderAssistantParts(
+    item.parts,
+    width,
+    false,
+    toolRenderer?.messagePresentation,
+  );
   for (const part of item.parts) {
     if (part.type === "toolCall") {
       const state = tools.get(part.toolId) ?? { phase: "pending" };
@@ -304,7 +363,8 @@ function renderTranscriptItem(
   toolRenderer?: AgentToolRenderer,
   expanded = false,
 ) {
-  if (item.kind === "user") return renderUserText(item.text, width);
+  if (item.kind === "user")
+    return renderUserText(item.text, width, toolRenderer?.messagePresentation);
   if (item.kind === "assistant") {
     return renderAssistantItem(
       theme,
@@ -386,7 +446,13 @@ function itemContext(
   return {
     tools,
     paired: false,
-    token: [...tools].map(([id, state]) => `${id}:${state.phase}`).join(","),
+    token: JSON.stringify(
+      [...tools].map(([id, state]) => [
+        id,
+        state.phase,
+        state.result?.outputPreview,
+      ]),
+    ),
   };
 }
 
@@ -399,17 +465,25 @@ function findResult(
 ) {
   const indices = pairing.resultsById.get(toolId);
   if (!indices) return undefined;
-  // Ascending by construction, so the first entry past the call is the match.
-  for (const index of indices) {
-    if (index <= callIndex) continue;
-    const candidate = transcript[index];
-    return candidate?.kind === "toolResult" ? candidate : undefined;
+  // Ascending by construction, so binary search the first entry past the call.
+  // Reused ids can have many results; bound each lookup to O(log results).
+  // Distinct ids (including parallel calls) already have constant-size indices,
+  // so this does not claim a speedup for that common case.
+  let low = 0;
+  let high = indices.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (indices[middle]! <= callIndex) low = middle + 1;
+    else high = middle;
   }
-  return undefined;
+  const index = indices[low];
+  if (index === undefined) return undefined;
+  const candidate = transcript[index];
+  return candidate?.kind === "toolResult" ? candidate : undefined;
 }
 
 /**
- * Caches finalized transcript items by identity and width. Live state remains
+ * Caches finalized transcript items by identity, width, and cwd. Live state remains
  * uncached because it changes on every stream tick; callers clear this cache
  * from their component's invalidate() when Pi changes theme.
  */
@@ -426,6 +500,7 @@ export class AgentTranscriptRenderer {
     const out: string[] = [];
     const now = options?.now ?? Date.now();
     const expanded = options?.expanded === true;
+    const presentation = document.toolRenderer?.messagePresentation;
     const liveTools = document.liveTools ?? [];
     if (document.toolRenderer) this.toolRenderers.add(document.toolRenderer);
     const liveIds = new Set(liveTools.map((tool) => tool.toolId));
@@ -434,8 +509,19 @@ export class AgentTranscriptRenderer {
     for (let index = 0; index < document.items.length; index++) {
       const item = document.items[index];
       const context = itemContext(document.items, index, liveIds, pairing);
-      const key = `${width}|${context.token}`;
-      const cacheable = !document.toolRenderer || !itemHasTool(item);
+      // Fallback tool rows relativize paths against the document's cwd.
+      const key = JSON.stringify([
+        width,
+        context.token,
+        document.cwd,
+        itemHasTool(item) && expanded,
+        presentation?.hideThinking,
+        presentation?.outputPad,
+        presentation?.codeBlockIndent,
+      ]);
+      const cacheable =
+        !document.toolRenderer ||
+        (!itemHasTool(item) && !presentation?.markdownTransformers.length);
       const cached = cacheable ? this.itemCache.get(item)?.get(key) : undefined;
       const lines =
         cached ??
@@ -470,7 +556,7 @@ export class AgentTranscriptRenderer {
       const parts: AgentTranscriptPart[] = [];
       if (thinking.trim()) parts.push({ type: "thinking", text: thinking });
       if (text.trim()) parts.push({ type: "text", text });
-      out.push(...renderAssistantParts(parts, width, true));
+      out.push(...renderAssistantParts(parts, width, true, presentation));
     }
 
     // Live tool executions. The manager drops a live entry when its ToolEnd

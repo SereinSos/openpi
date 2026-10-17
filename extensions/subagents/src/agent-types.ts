@@ -21,6 +21,7 @@
  */
 
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import {
@@ -92,6 +93,8 @@ export interface AgentType {
   readonly description: string;
   /** Omitted = the child keeps the normal tool set. Present = allowlist. */
   readonly tools?: readonly string[];
+  /** Only built-in investigator definitions carry this planning compatibility. */
+  readonly planningCompatible?: boolean;
   /** "provider/model-id" or a bare id; resolved by the pi backend. */
   readonly model?: string;
   readonly reasoningEffort?: ReasoningEffort;
@@ -121,47 +124,33 @@ export const READ_ONLY_AGENT_TOOLS = [
 export const BUILT_IN_AGENT_TYPES: readonly AgentType[] = [
   {
     name: "explorer",
+    planningCompatible: true,
     description:
-      "Read-only codebase exploration. Usually use moderate reasoning, increasing it for harder tasks.",
-    tools: READ_ONLY_AGENT_TOOLS,
-    body: "Explore the codebase read-only. Trace the real flow, inspect related callers, and report concise evidence with file paths and line references.",
+      "Codebase exploration. Usually use moderate reasoning, increasing it for harder tasks.",
+    body: "Explore the codebase. Trace the real flow, inspect related callers, and report concise evidence with file paths and line references.",
     source: "built-in:explorer",
   },
   {
     name: "implementer",
     description:
       "Focused implementation with repository checks. Usually use medium-high reasoning, adjusted for scope, risk, and task difficulty.",
-    tools: [
-      "read",
-      "bash",
-      "edit",
-      "write",
-      "grep",
-      "find",
-      "ls",
-      "fd",
-      "rg",
-      "git_show",
-      "git_diff",
-      "git_log",
-    ],
     body: "Implement the requested change carefully. Trace the affected flow first, make the smallest correct edit, and run relevant checks before reporting results.",
     source: "built-in:implementer",
   },
   {
     name: "reviewer",
+    planningCompatible: true,
     description:
-      "Read-only review for correctness, safety, and regressions. Usually use high reasoning, adjusted for task difficulty.",
-    tools: READ_ONLY_AGENT_TOOLS,
-    body: "Review the requested code or change read-only. Identify concrete correctness, security, and regression risks with evidence; do not modify files.",
+      "Review for correctness, safety, and regressions. Usually use high reasoning, adjusted for task difficulty.",
+    body: "Review the requested code or change. Identify concrete correctness, security, and regression risks with evidence.",
     source: "built-in:reviewer",
   },
   {
     name: "advisor",
+    planningCompatible: true,
     description:
-      "Deep read-only analysis and technical advice. Usually use high reasoning, adjusted for task difficulty.",
-    tools: READ_ONLY_AGENT_TOOLS,
-    body: "Analyze the problem deeply without modifying files. Explain the relevant tradeoffs, risks, and recommended next step using repository evidence.",
+      "Deep technical analysis and advice. Usually use high reasoning, adjusted for task difficulty.",
+    body: "Analyze the problem deeply. Explain the relevant tradeoffs, risks, and recommended next step using repository evidence.",
     source: "built-in:advisor",
   },
 ];
@@ -232,11 +221,14 @@ export function roleModelForAgentType(
     : undefined;
 }
 
-export interface AgentTypeDiagnostic {
-  /** File the problem came from, or the directory for a scan failure. */
+export type AgentTypeDiagnostic = {
+  /** File the diagnostic came from, or the directory for a scan failure. */
   readonly source: string;
   readonly message: string;
-}
+} & (
+  | { readonly kind: "override"; readonly name: string }
+  | { readonly kind?: undefined }
+);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -504,8 +496,8 @@ export interface LoadAgentTypesOptions {
 
 /**
  * Load built-in then global then project agent types. Each more-specific layer
- * overrides a complete same-name definition, and every replacement is reported
- * so a role never changes meaning silently.
+ * overrides a complete same-name definition. Report the effective overrides
+ * without suggesting that superseded or rejected definitions remain active.
  */
 export function loadAgentTypes(options: LoadAgentTypesOptions) {
   const global = loadDirectory(
@@ -540,6 +532,8 @@ export function loadAgentTypes(options: LoadAgentTypesOptions) {
       const shadowed = agentTypes.get(agentType.name);
       if (shadowed) {
         diagnostics.push({
+          kind: "override",
+          name: agentType.name,
           source: agentType.source,
           message: `overrides the agent type of the same name from ${shadowed.source}`,
         });
@@ -548,18 +542,69 @@ export function loadAgentTypes(options: LoadAgentTypesOptions) {
     }
   }
 
-  return { agentTypes, diagnostics };
+  return {
+    agentTypes,
+    diagnostics: diagnostics.filter(
+      (entry) =>
+        entry.kind !== "override" ||
+        agentTypes.get(entry.name)?.source === entry.source,
+    ),
+  };
 }
 
-/** One-line-per-problem notice, or undefined when everything loaded cleanly. */
-export function formatAgentTypeDiagnostics(
+/** Normal overrides are provenance, not problems. Keep real warnings separate. */
+export function formatAgentTypeNotices(
   diagnostics: readonly AgentTypeDiagnostic[],
+  home = homedir(),
 ) {
-  if (diagnostics.length === 0) return undefined;
-  return sanitizeTerminalText(
-    [
-      `Agent types: ${diagnostics.length} problem${diagnostics.length === 1 ? "" : "s"}.`,
-      ...diagnostics.map((entry) => `- ${entry.source}: ${entry.message}`),
-    ].join("\n"),
-  );
+  const shortSource = (source: string) => {
+    const relative = path.relative(home, source);
+    const display =
+      path.isAbsolute(source) &&
+      !path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`)
+        ? relative
+          ? `~/${relative.split(path.sep).join("/")}`
+          : "~"
+        : source;
+    return sanitizeTerminalText(display);
+  };
+  const warnings = diagnostics.filter((entry) => entry.kind !== "override");
+  // Keep this projection compact even if callers supply a replacement chain.
+  const overrides = new Map<string, string>();
+  for (const entry of diagnostics) {
+    if (entry.kind === "override")
+      overrides.set(
+        sanitizeTerminalText(entry.name),
+        shortSource(entry.source),
+      );
+  }
+  const notices: { level: "info" | "warning"; message: string }[] = [];
+  if (warnings.length) {
+    notices.push({
+      level: "warning",
+      message: sanitizeTerminalText(
+        [
+          `Agent roles · ${warnings.length} warning${warnings.length === 1 ? "" : "s"}`,
+          ...warnings.map(
+            (entry) => `  ${shortSource(entry.source)}\n    ${entry.message}`,
+          ),
+        ].join("\n"),
+      ),
+    });
+  }
+  if (overrides.size) {
+    const width = Math.max(...[...overrides.keys()].map((name) => name.length));
+    notices.push({
+      level: "info",
+      message: [
+        `Agent roles · ${overrides.size} custom override${overrides.size === 1 ? "" : "s"}`,
+        ...[...overrides].map(
+          ([name, source]) => `  ${name.padEnd(width)}  ← ${source}`,
+        ),
+      ].join("\n"),
+    });
+  }
+  return notices;
 }

@@ -15,7 +15,7 @@ import {
 import {
   AGENT_TYPE_LIMITS,
   BUILT_IN_AGENT_TYPES,
-  formatAgentTypeDiagnostics,
+  formatAgentTypeNotices,
   loadAgentTypes,
   parseAgentType,
   roleModelForAgentType,
@@ -64,7 +64,7 @@ async function seed(
   return { agentDir, cwd };
 }
 
-test("built-in roles have exact capability boundaries and no fixed model or effort defaults", () => {
+test("built-in roles inherit the parent tool surface and no fixed model or effort defaults", () => {
   assert.deepEqual(
     BUILT_IN_AGENT_TYPES.map((role) => ({
       name: role.name,
@@ -75,72 +75,35 @@ test("built-in roles have exact capability boundaries and no fixed model or effo
     [
       {
         name: "explorer",
-        tools: [
-          "read",
-          "grep",
-          "find",
-          "ls",
-          "fd",
-          "rg",
-          "git_show",
-          "git_diff",
-          "git_log",
-        ],
+        tools: undefined,
         effort: undefined,
         model: undefined,
       },
       {
         name: "implementer",
-        tools: [
-          "read",
-          "bash",
-          "edit",
-          "write",
-          "grep",
-          "find",
-          "ls",
-          "fd",
-          "rg",
-          "git_show",
-          "git_diff",
-          "git_log",
-        ],
+        tools: undefined,
         effort: undefined,
         model: undefined,
       },
       {
         name: "reviewer",
-        tools: [
-          "read",
-          "grep",
-          "find",
-          "ls",
-          "fd",
-          "rg",
-          "git_show",
-          "git_diff",
-          "git_log",
-        ],
+        tools: undefined,
         effort: undefined,
         model: undefined,
       },
       {
         name: "advisor",
-        tools: [
-          "read",
-          "grep",
-          "find",
-          "ls",
-          "fd",
-          "rg",
-          "git_show",
-          "git_diff",
-          "git_log",
-        ],
+        tools: undefined,
         effort: undefined,
         model: undefined,
       },
     ],
+  );
+  assert.deepEqual(
+    BUILT_IN_AGENT_TYPES.filter((role) => role.planningCompatible).map(
+      (role) => role.name,
+    ),
+    ["explorer", "reviewer", "advisor"],
   );
   assert.match(
     BUILT_IN_AGENT_TYPES[0]?.description ?? "",
@@ -335,11 +298,110 @@ test("a project agent type overrides the global one of the same name", async () 
 
     assert.equal(agentTypes.size, 4);
     assert.deepEqual(agentTypes.get("explorer")?.tools, ["read"]);
-    // Global replaces the built-in, then the trusted project replaces global.
-    const messages = diagnostics.map((entry) => entry.message).join("\n");
-    assert.match(messages, /from built-in:explorer/);
-    assert.match(messages, /from .*agent\/agents\/explorer\.md/);
+    assert.equal(agentTypes.get("explorer")?.planningCompatible, undefined);
+    // Report the final project override, not the superseded global definition.
+    assert.equal(diagnostics.length, 1);
+    assert.match(
+      diagnostics[0]?.message ?? "",
+      /from .*agent[\\/]agents[\\/]explorer\.md/,
+    );
   });
+});
+
+test("normal overrides are informational, compact, and show only the effective definition", async () => {
+  await withTempDir(async (root) => {
+    const { agentDir, cwd } = await seed(root, {
+      global: { "explorer.md": BUILT_IN_EXPLORER },
+      project: { "explorer.md": BUILT_IN_EXPLORER },
+    });
+    const loaded = loadAgentTypes({ agentDir, cwd, projectTrusted: true });
+    assert.ok(loaded.diagnostics.every((entry) => entry.kind === "override"));
+    const notices = formatAgentTypeNotices(loaded.diagnostics, root);
+    assert.deepEqual(notices, [
+      {
+        level: "info",
+        message:
+          "Agent roles · 1 custom override\n  explorer  ← ~/project/.pi/agents/explorer.md",
+      },
+    ]);
+    assert.doesNotMatch(notices[0]!.message, /problem|warning|built-in:/i);
+  });
+});
+
+test("a rejected project override never reports the blocked global role as active", async () => {
+  await withTempDir(async (root) => {
+    const { agentDir, cwd } = await seed(root, {
+      global: { "explorer.md": BUILT_IN_EXPLORER },
+      project: {
+        "explorer.md": "---\nname: explorer\n---\nMissing description.",
+      },
+    });
+    const loaded = loadAgentTypes({ agentDir, cwd, projectTrusted: true });
+    assert.equal(loaded.agentTypes.has("explorer"), false);
+    const notices = formatAgentTypeNotices(loaded.diagnostics, root);
+    assert.deepEqual(
+      notices.map((notice) => notice.level),
+      ["warning"],
+    );
+    assert.match(notices[0]!.message, /blocks fallback/);
+  });
+});
+
+test("warnings remain separate and take priority over normal overrides", () => {
+  const notices = formatAgentTypeNotices(
+    [
+      {
+        kind: "override",
+        name: "explorer",
+        source: "/home/test/agents/explorer.md",
+        message: "override",
+      },
+      {
+        source: "/home/test/agents/broken.md",
+        message: "invalid YAML; role rejected",
+      },
+      {
+        kind: "override",
+        name: "implementer",
+        source: "/home/test/agents/implementer.md",
+        message: "override",
+      },
+    ],
+    "/home/test",
+  );
+  assert.deepEqual(notices, [
+    {
+      level: "warning",
+      message:
+        "Agent roles · 1 warning\n  ~/agents/broken.md\n    invalid YAML; role rejected",
+    },
+    {
+      level: "info",
+      message:
+        "Agent roles · 2 custom overrides\n  explorer     ← ~/agents/explorer.md\n  implementer  ← ~/agents/implementer.md",
+    },
+  ]);
+});
+
+test("home abbreviation respects path boundaries and sanitizes override metadata", () => {
+  const notices = formatAgentTypeNotices(
+    [
+      {
+        kind: "override",
+        name: "explorer\u001b[31m",
+        source: "/home/test-other/agents/explorer.md\u001b]52;c;bad\u0007",
+        message: "override",
+      },
+    ],
+    "/home/test",
+  );
+  assert.deepEqual(notices, [
+    {
+      level: "info",
+      message:
+        "Agent roles · 1 custom override\n  explorer  ← /home/test-other/agents/explorer.md",
+    },
+  ]);
 });
 
 test("a missing agents directory is normal, and one bad file does not sink the rest", async () => {
@@ -373,10 +435,10 @@ test("a missing agents directory is normal, and one bad file does not sink the r
     ]);
     assert.equal(loaded.diagnostics.length, 1);
     assert.match(
-      formatAgentTypeDiagnostics(loaded.diagnostics) ?? "",
-      /1 problem/,
+      formatAgentTypeNotices(loaded.diagnostics)[0]?.message ?? "",
+      /1 warning/,
     );
-    assert.equal(formatAgentTypeDiagnostics([]), undefined);
+    assert.deepEqual(formatAgentTypeNotices([]), []);
   });
 });
 
@@ -440,13 +502,18 @@ test("model selection keeps parent inheritance until an override exists", () => 
 });
 
 test("agent-type diagnostics strip terminal control sequences", () => {
-  const notice = formatAgentTypeDiagnostics([
+  const notices = formatAgentTypeNotices([
     {
       source: "\u001b]52;c;Y2xpcGJvYXJk\u0007bad.md",
       message: "\u001b[31mwrong\u001b[0m",
     },
   ]);
-  assert.equal(notice, "Agent types: 1 problem.\n- bad.md: wrong");
+  assert.deepEqual(notices, [
+    {
+      level: "warning",
+      message: "Agent roles · 1 warning\n  bad.md\n    wrong",
+    },
+  ]);
 });
 
 test("childToolPolicy without an allowlist is unchanged", () => {
@@ -577,7 +644,7 @@ Body.
   assert.match(messages, /unrecognized tool "gerp"/);
 });
 
-test("a symlinked agent type is discovered like a real file", async () => {
+test("a symlinked agent type is discovered like a real file", async (t) => {
   // These commonly live in a dotfiles repo and are symlinked into place — the
   // same shape this user's own ~/.pi/agent/skills uses. `isFile()` is false
   // for a symlink, so the type simply never appeared, with no diagnostic.
@@ -586,10 +653,21 @@ test("a symlinked agent type is discovered like a real file", async () => {
     const real = path.join(root, "dotfiles");
     await mkdir(real, { recursive: true });
     await writeFile(path.join(real, "explore.md"), VALID);
-    await symlink(
-      path.join(real, "explore.md"),
-      path.join(agentDir, "agents", "explore.md"),
-    );
+    try {
+      await symlink(
+        path.join(real, "explore.md"),
+        path.join(agentDir, "agents", "explore.md"),
+      );
+    } catch (error) {
+      if (
+        process.platform === "win32" &&
+        (error as NodeJS.ErrnoException).code === "EPERM"
+      ) {
+        t.skip("Windows file symlinks require Developer Mode or elevation");
+        return;
+      }
+      throw error;
+    }
 
     const { agentTypes } = loadAgentTypes({
       agentDir,
@@ -611,7 +689,11 @@ test("a symlink pointing at a directory is still skipped", async () => {
     const { agentDir, cwd } = await seed(root, {});
     const dir = path.join(root, "notafile");
     await mkdir(dir, { recursive: true });
-    await symlink(dir, path.join(agentDir, "agents", "broken.md"));
+    await symlink(
+      dir,
+      path.join(agentDir, "agents", "broken.md"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
 
     const { agentTypes } = loadAgentTypes({
       agentDir,

@@ -7,13 +7,19 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  DefaultResourceLoader,
+  SettingsManager,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { createPiBuiltinExtensionFactories } from "../../../extensions/shared/pi-builtin-extensions.ts";
 import { Type } from "typebox";
 import { agentCallKey } from "../../../extensions/workflows/journal.ts";
 import {
@@ -27,6 +33,35 @@ import {
 
 function git(cwd: string, ...args: string[]) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function assertSameDirectory(actual: string, expected: string) {
+  const actualStats = statSync(actual);
+  const expectedStats = statSync(expected);
+  assert.deepEqual(
+    { dev: actualStats.dev, ino: actualStats.ino },
+    { dev: expectedStats.dev, ino: expectedStats.ino },
+  );
+}
+
+function createFileSymlinkOrSkip(
+  t: { skip(message?: string): void },
+  target: string,
+  path: string,
+) {
+  try {
+    symlinkSync(target, path);
+    return true;
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      (error as NodeJS.ErrnoException).code === "EPERM"
+    ) {
+      t.skip("Windows file symlinks require Developer Mode or elevation");
+      return false;
+    }
+    throw error;
+  }
 }
 
 function recordingGit(commands: string[][]) {
@@ -227,13 +262,17 @@ test("replay filesystem boundary permits repo-local observers and rejects escapi
   }
 });
 
-test("replay filesystem boundary fails closed for symlinks and uncertain paths", async () => {
+test("replay filesystem boundary fails closed for symlinks and uncertain paths", async (t) => {
   const cwd = repository();
   const outside = mkdtempSync(path.join(tmpdir(), "pi-replay-symlink-"));
   try {
     const outsideFile = path.join(outside, "outside.txt");
     writeFileSync(outsideFile, "external one\n");
-    symlinkSync(outsideFile, path.join(cwd, "external-link"));
+    if (
+      !createFileSymlinkOrSkip(t, outsideFile, path.join(cwd, "external-link"))
+    ) {
+      return;
+    }
     let observations = 0;
     let violations = 0;
     const definition = filesystemTool("read", (pathname) => {
@@ -417,11 +456,12 @@ test("canonical cwd and repository state participate in replay identity", () => 
       true,
     );
     assert.equal(originalIdentity?.version, 3);
-    assert.equal(originalIdentity?.repositoryRoot, realpathSync(cwd));
+    assert.ok(originalIdentity);
+    assertSameDirectory(originalIdentity.repositoryRoot, realpathSync(cwd));
     const original = replayKey(cwd, resourcePath);
 
     const alias = path.join(path.dirname(cwd), `${path.basename(cwd)}-alias`);
-    symlinkSync(cwd, alias, "dir");
+    symlinkSync(cwd, alias, process.platform === "win32" ? "junction" : "dir");
     try {
       assert.equal(
         replayKey(alias, path.join(alias, "resource.md")),
@@ -429,7 +469,7 @@ test("canonical cwd and repository state participate in replay identity", () => 
         "a symlink spelling of the same cwd must canonicalize",
       );
     } finally {
-      rmSync(alias, { force: true });
+      rmSync(alias, { recursive: true, force: true });
     }
 
     const nested = path.join(cwd, "nested");
@@ -486,13 +526,21 @@ test("ignored observable files disable replay rather than returning stale output
   }
 });
 
-test("tracked and untracked symlinks disable replay", () => {
+test("tracked and untracked symlinks disable replay", (t) => {
   for (const tracked of [true, false]) {
     const cwd = repository();
     try {
       const resourcePath = path.join(cwd, "resource.md");
       writeFileSync(resourcePath, "resource\n");
-      symlinkSync("tracked.txt", path.join(cwd, "observable-link"));
+      if (
+        !createFileSymlinkOrSkip(
+          t,
+          "tracked.txt",
+          path.join(cwd, "observable-link"),
+        )
+      ) {
+        return;
+      }
       if (tracked) {
         git(cwd, "add", "observable-link");
         git(cwd, "commit", "-qm", "track symlink");
@@ -580,7 +628,7 @@ test("replay fingerprint keeps the early ignored gate and post-diff safety gates
     const commands: string[][] = [];
     const fingerprint = repositoryFingerprint(cwd, recordingGit(commands));
     assert.ok(fingerprint);
-    assert.equal(fingerprint.root, realpathSync(cwd));
+    assertSameDirectory(fingerprint.root, realpathSync(cwd));
     assert.deepEqual(commands, [
       ["rev-parse", "--show-toplevel"],
       [
@@ -626,5 +674,73 @@ test("fingerprint inability fails closed", () => {
     );
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("unknown inline and built-in extension identities disable replay", async () => {
+  const cwd = repository();
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-replay-inline-"));
+  try {
+    for (const [name, builtin, instruction] of [
+      ["behavior-a", false, "Answer ALPHA"],
+      ["behavior-b", false, "Answer BETA"],
+      ["unreviewed", true, "Answer GAMMA"],
+    ] as const) {
+      const resourceLoader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: SettingsManager.inMemory(),
+        extensionFactories: [
+          {
+            name,
+            builtin,
+            factory: (pi) => {
+              pi.on("before_agent_start", (event) => ({
+                systemPrompt: `${event.systemPrompt}\n${instruction}`,
+              }));
+            },
+          },
+        ],
+      });
+      await resourceLoader.reload();
+      assert.equal(resourceLoader.getExtensions().errors.length, 0);
+      assert.equal(resourceLoader.getExtensions().extensions.length, 1);
+      assert.equal(
+        createReplayIdentity(cwd, resourceLoader, true),
+        undefined,
+        "unverifiable extension behavior must not produce a reusable result identity",
+      );
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("reviewed Pi built-ins remain fingerprintable and their enabled identities distinguish replay keys", async () => {
+  const cwd = repository();
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-replay-builtin-"));
+  try {
+    const keys = [];
+    for (const factory of createPiBuiltinExtensionFactories()) {
+      const resourceLoader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: SettingsManager.inMemory(),
+        extensionFactories: [factory],
+      });
+      await resourceLoader.reload();
+      assert.equal(resourceLoader.getExtensions().errors.length, 0);
+      assert.equal(resourceLoader.getExtensions().extensions.length, 1);
+      const identity = createReplayIdentity(cwd, resourceLoader, true);
+      assert.ok(identity, "reviewed built-ins must not disable journaling");
+      keys.push(
+        agentCallKey("inspect", { execution: { replayIdentity: identity } }),
+      );
+    }
+    assert.equal(new Set(keys).size, keys.length);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
   }
 });

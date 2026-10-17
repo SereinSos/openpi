@@ -9,10 +9,17 @@ import {
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { formatContextUtilization } from "../shared/context-utilization.ts";
+import type {
+  DelegationCompletion,
+  DelegationOutcome,
+  DelegationReplayOrigin,
+} from "../shared/delegation-completion.ts";
 import { spinnerFrame } from "../shared/spinner.ts";
 import { sanitizeTerminalText } from "../shared/terminal-text.ts";
 import type { WorktreeCleanup } from "../shared/worktree.ts";
 import type { AcceptanceLedger } from "./acceptance.ts";
+import { workflowAgentCompletion } from "./agent-completion.ts";
+import type { ExecutionTimingSummary } from "./execution-timing.ts";
 import {
   projectWorkflowGraph,
   type WorkflowGraphProjection,
@@ -67,6 +74,10 @@ export type WorkflowDeliveryState =
 export interface WorkflowDelivery {
   /** Stable per-run idempotency identity, never a transport-batch id. */
   id: string;
+  /** Destination transcript identity; legacy records fall back to run.sessionId. */
+  ownerSessionId?: string;
+  /** Process-local generation of the Pi SessionManager owner. */
+  ownerEpoch?: number;
   state: WorkflowDeliveryState;
   attempts: number;
   updatedAt: number;
@@ -99,6 +110,17 @@ export interface TranscriptEntry {
 
 export interface AgentRecord {
   index: number;
+  /** Additive owner facts for the shared completion projection. */
+  executionOutcome?: DelegationOutcome;
+  resultPersistence?: "saved" | "failed";
+  resultHasText?: boolean;
+  resultHasStructured?: boolean;
+  requestedCwd?: string;
+  effectiveCwd?: string;
+  isolation?: "shared" | "worktree";
+  replayOrigin?: DelegationReplayOrigin | "unknown";
+  /** Read-only tool projection; canonical facts remain in this owner record. */
+  completion?: DelegationCompletion;
   /** Stable identity and independent intent/admission/execution status planes. */
   callId?: string;
   invocation?: InvocationRecord;
@@ -110,6 +132,10 @@ export interface AgentRecord {
   resultRef?: string;
   /** Run-directory-relative authoritative result captured before projection. */
   resultArtifact?: string;
+  /** Privacy-safe event summary, independent of bounded transcripts. */
+  timing?: ExecutionTimingSummary;
+  timingArtifact?: string;
+  timingArtifactState?: "saved" | "failed";
   label: string;
   phase?: string;
   state: AgentState;
@@ -123,7 +149,7 @@ export interface AgentRecord {
   usage: AgentUsage;
   /** Replayed from a prior run's journal instead of actually executed. */
   replayed?: boolean;
-  /** Explicit caller-supplied acceptance result; never inferred from role/task. */
+  /** Deprecated child self-attestation; never runtime-observed evidence. */
   acceptance?: AcceptanceLedger;
   /** Branch of the isolated worktree this agent ran in, when it holds commits. */
   worktreeBranch?: string;
@@ -179,6 +205,11 @@ export interface WorkflowDetails {
   logs?: WorkflowLogEntry[];
   /** Oldest lines discarded once the ring filled, reported rather than hidden. */
   logsDropped?: number;
+  /**
+   * Whole agent transcripts dropped from transcripts.json when the run exceeded
+   * that artifact's byte budget, reported rather than silently truncated.
+   */
+  transcriptsOmitted?: { agents: number; entries: number };
   result?: unknown;
   resultArtifact?: string;
   transcriptArtifact?: string;
@@ -206,7 +237,11 @@ export function compactWorkflowToolDetails(
           ),
         }
       : {}),
-    agents: details.agents.map((agent) => ({ ...agent, transcript: [] })),
+    agents: details.agents.map((agent) => ({
+      ...agent,
+      completion: workflowAgentCompletion(details.runId, agent),
+      transcript: [],
+    })),
   };
 }
 
@@ -312,11 +347,29 @@ export function resolveWorkflowRunTarget(
 
   const normalizedTarget = trimmed.toLowerCase();
   const runIds = [...new Set([...candidates].filter(isWorkflowRunId))].sort();
-  if (isWorkflowRunId(normalizedTarget) && runIds.includes(normalizedTarget)) {
-    return { ok: true, runId: normalizedTarget } as const;
+  const normalizedRunIds = runIds.map((runId) => ({
+    runId,
+    normalized: runId.toLowerCase(),
+  }));
+  if (isWorkflowRunId(normalizedTarget)) {
+    const exactCase = runIds.find((runId) => runId === trimmed);
+    if (exactCase) return { ok: true, runId: exactCase } as const;
+    const exactMatches = normalizedRunIds.filter(
+      (candidate) => candidate.normalized === normalizedTarget,
+    );
+    if (exactMatches.length === 1)
+      return { ok: true, runId: exactMatches[0]!.runId } as const;
+    if (exactMatches.length > 1) {
+      return {
+        ok: false,
+        error: `Workflow run id "${sanitizeLine(trimmed, 80)}" is ambiguous by case. Matches: ${boundedRunList(exactMatches.map((candidate) => candidate.runId))}. Use the exact case of the canonical run id.`,
+      } as const;
+    }
   }
 
-  const matches = runIds.filter((runId) => runId.endsWith(normalizedTarget));
+  const matches = normalizedRunIds
+    .filter((candidate) => candidate.normalized.endsWith(normalizedTarget))
+    .map((candidate) => candidate.runId);
   if (matches.length === 1) return { ok: true, runId: matches[0]! } as const;
 
   const displayTarget = sanitizeLine(trimmed, 80);

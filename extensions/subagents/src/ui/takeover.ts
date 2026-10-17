@@ -11,7 +11,12 @@ import type {
   KeybindingsManager,
   Theme,
 } from "@earendil-works/pi-coding-agent";
-import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
+import type {
+  Component,
+  Focusable,
+  TUI,
+  TuiMouseEvent,
+} from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { AgentSessionPage } from "../../../shared/agent-session-page.ts";
 import { hintLine, panelFrame } from "../../../shared/screen-chrome.ts";
@@ -272,11 +277,17 @@ export class SubagentDashboard implements Component {
     const running = subs.filter((snap) => snap.status === "running").length;
     const done = subs.filter((snap) => snap.status === "done").length;
     const failed = subs.filter((snap) => snap.status === "error").length;
+    const admission = this.view.childExecutionAdmission?.();
+    const admissionSummary =
+      admission?.enabled && admission.limit !== undefined
+        ? `${admission.held}/${admission.limit} session slots · ${admission.queued} queued · wf ${admission.heldByOrigin.workflow} / direct ${admission.heldByOrigin.direct} / btw ${admission.heldByOrigin.btw}`
+        : undefined;
     const summary =
       [
         running > 0 ? `${running} running` : "",
         done > 0 ? `${done} done` : "",
         failed > 0 ? `${failed} failed` : "",
+        admissionSummary ?? "",
       ]
         .filter(Boolean)
         .join(" · ") || "no agents";
@@ -290,7 +301,7 @@ export class SubagentDashboard implements Component {
       // One empty row of air between the conversation and the docked panel.
       "",
       ...panelFrame(theme, {
-        label: `Subagents · ${summary}`,
+        label: `Subagents · ${summary}${admission?.blockedReason ? ` · ${admission.blockedReason}` : ""}`,
         rows: rowLines,
         width,
         height: rowLines.length + 2,
@@ -476,6 +487,7 @@ export class TakeoverView implements Component, Focusable {
     if (this.closed) return false;
     this.closed = true;
     this.unsubscribe();
+    this.page.dispose();
     if (this.ticker) clearInterval(this.ticker);
     if (this.renderTimer) clearTimeout(this.renderTimer);
     this.renderTimer = undefined;
@@ -492,6 +504,10 @@ export class TakeoverView implements Component, Focusable {
 
   handleInput(data: string): void {
     this.page.handleInput(data);
+  }
+
+  handleMouse(event: TuiMouseEvent) {
+    return this.page.handleMouse(event);
   }
 
   render(width: number): string[] {

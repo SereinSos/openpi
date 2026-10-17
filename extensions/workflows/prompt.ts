@@ -4,6 +4,7 @@ import {
 } from "../shared/result-budget.ts";
 import { sanitizeTerminalText } from "../shared/terminal-text.ts";
 import { projectText } from "../shared/text-projection.ts";
+import { workflowCompletionLines } from "./agent-completion.ts";
 import {
   countStates,
   formatElapsed,
@@ -11,6 +12,9 @@ import {
   shortenHome,
   type WorkflowDetails,
 } from "./model.ts";
+
+const COMPLETION_DELIVERY_FACTS_LIMIT_ERROR =
+  "Workflow completion delivery facts exceed the transport payload limit";
 
 /** Model-facing schema descriptions for workflow source and launch policy. */
 export const WORKFLOW_PARAMETER_DESCRIPTIONS = {
@@ -56,7 +60,7 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "Interactive sessions launch in the background by default and deliver completion later. Set wait: true only when this tool call must return the final result inline.",
   "Derive fan-out from independent verifiable work items and task difficulty. Concurrency is a runtime ceiling, not a target or the total-call limit; user cost, count, model, and effort constraints take precedence.",
   "For concurrent writers use isolation: 'worktree' and tell each agent to commit. Read-only work should normally stay in the shared checkout.",
-  "Read the workflows Skill before a nontrivial script; it covers the restricted sandbox, full DSL, acceptance, result refs, replay, background lifecycle, limits, and examples.",
+  "Read the workflows Skill before a nontrivial script; it covers the restricted sandbox, full DSL, result refs, replay, background lifecycle, limits, and examples.",
 ].join("\n");
 
 /** Adds workflow orchestration primitives and background execution to the model's tool prompt. */
@@ -74,14 +78,6 @@ export const WORKFLOW_PROMPT_GUIDELINES = [
 export function buildWorkflowAgentPrompt(prompt: string) {
   return prompt;
 }
-
-/** Instructs structured workflow children to terminate with exactly one structured_output call. */
-export const STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION =
-  "When your task is complete, call the `structured_output` tool exactly once as your final action, with fields matching the required schema. Do not write any other text after it.";
-
-/** Describes the terminating structured_output tool and its final-action contract. */
-export const STRUCTURED_OUTPUT_TOOL_DESCRIPTION =
-  "Return your final result as structured data matching the required schema. Call this exactly once, as your last action; do not write any other text after it.";
 
 /** Builds the workflow completion report returned to the parent model. */
 export function buildWorkflowResultMessage(
@@ -157,11 +153,14 @@ export function buildWorkflowResultMessage(
               : "running";
       lines.push(
         `- [${agent.label}]${agent.phase ? ` (${agent.phase})` : ""} ${status}` +
-          (agent.acceptance ? ` · acceptance ${agent.acceptance.status}` : "") +
+          (agent.acceptance
+            ? ` · deprecated model self-attestation ${agent.acceptance.status}`
+            : "") +
           (agent.error ? ` — ${agent.error}` : ""),
       );
     }
   }
+  lines.push("", ...workflowCompletionLines(details.runId, details.agents));
   if (details.result !== undefined)
     lines.push("", "Result:", resultJson(details.result));
   return sanitizeTerminalText(lines.join("\n"));
@@ -240,9 +239,7 @@ export function buildProjectedWorkflowCompletionBatch(
     manifestSeparatorBytes;
   const bodyBudget = 48 * 1024 - fixedBytes;
   if (bodyBudget < 0) {
-    throw new Error(
-      "Workflow completion delivery facts exceed the transport payload limit",
-    );
+    throw new Error(COMPLETION_DELIVERY_FACTS_LIMIT_ERROR);
   }
   const allocation = allocateResultBudgets(
     full.map((message) => Buffer.byteLength(message, "utf8")),
@@ -281,26 +278,42 @@ export function buildProjectedWorkflowCompletionBatches(
     entries: (typeof entries)[number][];
     content: string;
   }> = [];
-  let current: (typeof entries)[number][] = [];
-  for (const entry of entries) {
-    const candidate = [...current, entry];
-    try {
-      buildProjectedWorkflowCompletionBatch(candidate, usage);
-      current = candidate;
-    } catch (error) {
-      if (current.length === 0) throw error;
-      batches.push({
-        entries: current,
-        content: buildProjectedWorkflowCompletionBatch(current, usage),
-      });
-      current = [entry];
+  let start = 0;
+  while (start < entries.length) {
+    let low = start + 1;
+    let high = entries.length;
+    let selected:
+      | {
+          entries: (typeof entries)[number][];
+          content: string;
+        }
+      | undefined;
+    let firstError: unknown;
+
+    // A candidate only fails when its stable delivery-facts manifest exceeds
+    // the transport budget, so prefix feasibility is monotonic.
+    while (low <= high) {
+      const end = Math.floor((low + high) / 2);
+      const candidate = entries.slice(start, end);
+      try {
+        const content = buildProjectedWorkflowCompletionBatch(candidate, usage);
+        selected = { entries: candidate, content };
+        low = end + 1;
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          error.message !== COMPLETION_DELIVERY_FACTS_LIMIT_ERROR
+        ) {
+          throw error;
+        }
+        firstError ??= error;
+        high = end - 1;
+      }
     }
-  }
-  if (current.length > 0) {
-    batches.push({
-      entries: current,
-      content: buildProjectedWorkflowCompletionBatch(current, usage),
-    });
+
+    if (!selected) throw firstError;
+    batches.push(selected);
+    start += selected.entries.length;
   }
   return batches;
 }
@@ -334,6 +347,7 @@ export function buildWorkflowStatusSummary(
     details.currentPhase ? `Current phase: ${details.currentPhase}` : undefined,
     details.delivery ? `Delivery: ${details.delivery.state}.` : undefined,
     `Artifacts: ${shortenHome(runDir)}`,
+    ...workflowCompletionLines(details.runId, details.agents),
   ]
     .filter(Boolean)
     .join("\n");

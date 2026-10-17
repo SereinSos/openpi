@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 import type {
   AgentSession,
@@ -27,7 +27,19 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  createSyntheticSourceInfo,
+  DefaultResourceLoader,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import { shutdownAndDisposeChildSession } from "../../../extensions/shared/child-session.ts";
 import { SPINNER_INTERVAL_MS } from "../../../extensions/shared/spinner.ts";
+import {
+  webCapabilityDetail,
+  webCapabilitySnapshot,
+} from "../../../extensions/shared/web-observer-registry.ts";
 import { reclaimWorktree } from "../../../extensions/shared/worktree.ts";
 import { persistWorkflowJson } from "../../../extensions/workflows/artifacts.ts";
 import {
@@ -35,6 +47,7 @@ import {
   type WorkflowDetails,
 } from "../../../extensions/workflows/model.ts";
 import type { WorkflowAgentSessionFactory } from "../../../extensions/workflows/runner.ts";
+import { toolExecutionContext } from "../../support/extension-tool-context.ts";
 
 const agentDir = mkdtempSync(join(tmpdir(), "my-pi-setup-wf-e2e-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -55,6 +68,18 @@ git(["config", "user.name", "Workflow E2E"]);
 writeFileSync(join(repoDir, "fixture.txt"), "fixture\n");
 git(["add", "."]);
 git(["commit", "-q", "-m", "fixture"]);
+
+// Replay tests deliberately opt into a bounded custom role. Built-in roles
+// now inherit tools and cannot promise a repository-only replay identity.
+mkdirSync(join(agentDir, "agents"), { recursive: true });
+writeFileSync(
+  join(agentDir, "agents", "bounded-reviewer.md"),
+  "---\nname: bounded-reviewer\ndescription: Replay fixture\ntools: [read]\n---\nInspect the repository without modifications.\n",
+);
+writeFileSync(
+  join(agentDir, "agents", "explicit-parent-fixture.md"),
+  "---\nname: explicit-parent-fixture\ndescription: Requires a parent fixture\ntools: [read, parent_fixture]\n---\nUse parent_fixture to verify the result.\n",
+);
 
 const {
   default: workflows,
@@ -84,7 +109,7 @@ type SentMessage = {
 };
 
 const tools = new Map<string, CapturedTool>();
-let activeTools: string[] = [];
+let activeTools: string[] = ["read"];
 const handlers = new Map<
   string,
   Array<(event: unknown, ctx: ExtensionContext) => unknown>
@@ -111,6 +136,11 @@ const pi = {
   },
   getThinkingLevel: () => "off",
   getActiveTools: () => [...activeTools],
+  getAllTools: () =>
+    activeTools.map((name) => ({
+      name,
+      sourceInfo: createSyntheticSourceInfo(`<sdk:${name}>`, { source: "sdk" }),
+    })),
   setActiveTools(names: string[]) {
     activeTools = [...names];
   },
@@ -476,7 +506,7 @@ test("interrupting an inline wait leaves the run stoppable and delivers one term
         {
           script:
             'export const meta = { name: "interrupted-inline-wait" };\n' +
-            'return await agent("wait for interruption", { agent_type: "reviewer" });',
+            'return await agent("wait for interruption", { agent_type: "bounded-reviewer" });',
           wait: true,
         },
         controller.signal,
@@ -611,7 +641,7 @@ test("a settled launch card does not repaint while its detached run stays active
       {
         script:
           'export const meta = { name: "detached-render" };\n' +
-          'return await agent("wait for release", { agent_type: "reviewer" });',
+          'return await agent("wait for release", { agent_type: "bounded-reviewer" });',
       },
       undefined,
       undefined,
@@ -634,6 +664,8 @@ test("a settled launch card does not repaint while its detached run stays active
           invalidations += 1;
         },
         lastComponent: undefined,
+        ...{ durationMs: undefined },
+        ...{ outputPad: 0 },
         state: {},
         cwd: repoDir,
         executionStarted: true,
@@ -750,6 +782,10 @@ test("shutdown preserves a failed completion for reload recovery", async () => {
     "pending",
   );
 
+  // A native reload replaces the disposed SessionManager and its closed pool.
+  Object.defineProperty(ctx, "sessionManager", {
+    value: { ...ctx.sessionManager },
+  });
   const reloadedHandlers = new Map<
     string,
     Array<(event: unknown, ctx: ExtensionContext) => unknown>
@@ -782,18 +818,20 @@ test("shutdown preserves a failed completion for reload recovery", async () => {
     "delivered",
   );
 
-  // The original instance represents the process that was replaced. Drain
-  // its intentionally retained in-memory retry so later tests do not batch it
-  // with an unrelated completion; the assertion above was reached solely via
-  // the fresh instance and persisted session state.
+  // The original instance represents the process that was replaced. Its
+  // owner was disposed at shutdown, so the shared inbox must dead-letter the
+  // stale in-memory retry rather than append a duplicate to the revived
+  // Session. The fresh instance recovered solely from canonical durable state.
   for (const handler of handlers.get("agent_settled") ?? []) {
     await handler({}, ctx);
   }
-  await waitFor(
-    () => sentMessages.length === 2,
-    "discarded predecessor instance retry",
-  );
+  assert.equal(sentMessages.length, 1);
   sentMessages.length = 0;
+  // Later cases use the original fixture instance again. Re-establish its
+  // native Session lifecycle rather than reviving it from a tool callback.
+  for (const handler of handlers.get("session_start") ?? []) {
+    await handler({}, { ...ctx, mode: "print" } as ExtensionContext);
+  }
 });
 
 test("cancelled detached delivery preserves aborted status after artifact persistence failure", async () => {
@@ -815,7 +853,7 @@ test("cancelled detached delivery preserves aborted status after artifact persis
       {
         script:
           'export const meta = { name: "cancelled-persistence-failure" };\n' +
-          'return await agent("wait for cancellation", { agent_type: "reviewer" });',
+          'return await agent("wait for cancellation", { agent_type: "bounded-reviewer" });',
         background: true,
       },
       undefined,
@@ -952,6 +990,156 @@ test("settled retention is bounded while status and artifacts remain observable"
   assert.equal(lookup.details.runs[0]?.status, "completed");
 });
 
+test("Web workflow children resolve only exact active or retained owner evidence", async () => {
+  const ownerTools = new Map<string, CapturedTool>();
+  const ownerHandlers = new Map<
+    string,
+    Array<(event: unknown, ctx: ExtensionContext) => unknown>
+  >();
+  const ownerCtx = {
+    ...ctx,
+    sessionManager: {
+      getSessionId: () => "wf-web-owner-session",
+      getEntries: () => [],
+    },
+  } as unknown as ExtensionContext;
+  workflows(
+    {
+      ...pi,
+      registerTool(tool: CapturedTool) {
+        ownerTools.set(tool.name, tool);
+      },
+      on(event: string, handler: unknown) {
+        ownerHandlers.set(event, [
+          ...(ownerHandlers.get(event) ?? []),
+          handler as (event: unknown, ctx: ExtensionContext) => unknown,
+        ]);
+      },
+    } as unknown as ExtensionAPI,
+    { settledRetention: { maxRuns: 8, maxBytes: 64 * 1024 } },
+  );
+  for (const handler of ownerHandlers.get("session_start") ?? []) {
+    await handler({}, { ...ownerCtx, mode: "print" } as ExtensionContext);
+  }
+  const ownerWorkflow = ownerTools.get("workflow")!;
+  const scope = ownerCtx.sessionManager;
+  let releasePrompt = () => {};
+  const promptGate = new Promise<void>((resolve) => {
+    releasePrompt = resolve;
+  });
+  let prompted = false;
+  __setWorkflowTestAgentSessionFactory(async () => ({
+    session: fakeAgentSession("owned workflow answer", promptGate, () => {
+      prompted = true;
+    }),
+  }));
+
+  try {
+    const script =
+      'export const meta = { name: "web-owner" };\nreturn await agent("Inspect the fixture", { agent_type: "bounded-reviewer", label: "Inspector" });';
+    const launch = (await ownerWorkflow.execute(
+      "e2e-web-workflow-owner",
+      { script, wait: false },
+      undefined,
+      undefined,
+      ownerCtx,
+    )) as { details: { runId: string } };
+    const runId = launch.details.runId;
+    const id = `${runId}:call:1`;
+    await waitFor(() => prompted, "Web workflow active child");
+    const active = webCapabilitySnapshot(scope)?.workflows?.items.find(
+      (item) => item.runId === runId,
+    );
+    assert.equal(active?.children?.items[0]?.id, id);
+    assert.equal(active?.children?.items[0]?.status, "running");
+    const activeReceipt = webCapabilityDetail(scope, "workflows", id);
+    assert.equal(activeReceipt.status, "found");
+    assert.ok(
+      activeReceipt.status === "found" &&
+        activeReceipt.detail.kind === "workflows",
+    );
+    assert.equal(activeReceipt.detail.transcriptUnavailable, false);
+    assert.equal(
+      webCapabilityDetail({}, "workflows", id).status,
+      "unavailable",
+    );
+    assert.equal(
+      webCapabilityDetail(scope, "workflows", `${runId}:call:01`).status,
+      "missing",
+    );
+    assert.equal(
+      webCapabilityDetail(scope, "workflows", "Inspector").status,
+      "missing",
+    );
+
+    releasePrompt();
+    await waitFor(
+      () =>
+        webCapabilitySnapshot(scope)?.workflows?.items.find(
+          (item) => item.runId === runId,
+        )?.status === "completed",
+      "Web workflow retained child",
+    );
+    const settled = webCapabilityDetail(scope, "workflows", id);
+    assert.ok(
+      settled.status === "found" && settled.detail.kind === "workflows",
+    );
+    assert.equal(settled.detail.status, "done");
+    assert.equal(settled.detail.transcriptUnavailable, true);
+    assert.deepEqual(settled.detail.transcript, []);
+    assert.equal(settled.detail.finalText, "");
+    assert.equal(
+      JSON.stringify(settled).includes("owned workflow answer"),
+      false,
+    );
+    assert.ok(
+      readFileSync(join(runDirFor(runId), "transcripts.json"), "utf8").includes(
+        "owned workflow answer",
+      ),
+    );
+
+    const resumed = (await ownerWorkflow.execute(
+      "e2e-web-workflow-replay",
+      { script, resume_from_run_id: runId, wait: true },
+      undefined,
+      undefined,
+      ownerCtx,
+    )) as { details: WorkflowDetails };
+    const replayDetail = webCapabilityDetail(
+      scope,
+      "workflows",
+      `${resumed.details.runId}:call:1`,
+    );
+    assert.ok(
+      replayDetail.status === "found" &&
+        replayDetail.detail.kind === "workflows",
+    );
+    assert.notEqual(replayDetail.detail.id, id);
+    assert.equal(replayDetail.detail.replayed, true);
+    assert.equal(replayDetail.detail.transcriptUnavailable, true);
+    assert.equal(replayDetail.detail.finalText, "");
+
+    // Canonical disk evidence deliberately stays outside this in-memory Web seam.
+    for (let index = 0; index < 8; index++) {
+      await ownerWorkflow.execute(
+        `e2e-web-owner-eviction-${index}`,
+        { script: `return ${index};`, wait: true },
+        undefined,
+        undefined,
+        ownerCtx,
+      );
+    }
+    assert.equal(webCapabilityDetail(scope, "workflows", id).status, "missing");
+    assert.equal(existsSync(join(runDirFor(runId), "transcripts.json")), true);
+  } finally {
+    releasePrompt();
+    __setWorkflowTestAgentSessionFactory(undefined);
+    for (const handler of ownerHandlers.get("session_shutdown") ?? []) {
+      await handler({}, ownerCtx);
+    }
+  }
+});
+
 test("agent calls run through the injected session factory and resume replays the journal", async () => {
   let sessionCreations = 0;
   const factory: WorkflowAgentSessionFactory = async () => {
@@ -962,7 +1150,7 @@ test("agent calls run through the injected session factory and resume replays th
 
   const agentScript =
     'export const meta = { name: "agent-run" };\n' +
-    'const r = await agent("say something", { agent_type: "reviewer", label: "speaker" });\n' +
+    'const r = await agent("say something", { agent_type: "bounded-reviewer", label: "speaker" });\n' +
     'log("agent said: " + r.output);\n' +
     "return { ok: r.ok, output: r.output };";
 
@@ -975,20 +1163,59 @@ test("agent calls run through the injected session factory and resume replays th
       ctx,
     )) as {
       content: Array<{ type: string; text: string }>;
-      details: { runId?: unknown };
+      details: WorkflowDetails;
     };
     const firstText = first.content[0]!.text;
     assert.match(firstText, /"agent-run" completed/);
     assert.match(firstText, /injected agent output/);
     assert.equal(sessionCreations, 1);
+    assert.equal(
+      first.details.agents[0]?.completion?.observed.outcome,
+      "success",
+    );
+    assert.equal(
+      first.details.agents[0]?.completion?.verification.status,
+      "unknown",
+    );
 
     const firstRunId = first.details.runId;
+    const queried = (await status.execute("e2e-completion-query", {
+      runId: firstRunId,
+    })) as { details: { completions: unknown[] } };
+    assert.deepEqual(
+      queried.details.completions[0],
+      first.details.agents[0]?.completion,
+    );
     const firstDir = runDirFor(firstRunId);
+    const textRef = first.details.agents[0]?.completion?.modelClaimed.textRef;
+    assert.equal(textRef, `${firstRunId}/agent-results/agent-0001.json`);
+    // Resolve through the existing workflow run owner, not a new registry.
+    const savedResult = JSON.parse(
+      readFileSync(
+        join(firstDir, textRef.slice(firstRunId.length + 1)),
+        "utf8",
+      ),
+    );
+    assert.equal(savedResult.output, "injected agent output");
+    assert.equal(
+      JSON.stringify(first.details.agents[0]?.completion).includes(firstDir),
+      false,
+    );
     // A replay-safe read-only agent call is journaled on success.
     const journal = JSON.parse(
       readFileSync(join(firstDir, "journal.json"), "utf8"),
-    ) as { entries: unknown[] };
+    ) as {
+      entries: Array<{ origin?: { executionId: string; evidenceRef: string } }>;
+    };
     assert.equal(journal.entries.length, 1);
+    assert.equal(
+      journal.entries[0]?.origin?.executionId,
+      `${firstRunId}:call:1`,
+    );
+    assert.equal(
+      journal.entries[0]?.origin?.evidenceRef,
+      `${firstRunId}/agent-results/agent-0001.json`,
+    );
 
     // Resume with identical script and call content: the journal hit means no
     // new child session is created.
@@ -1004,12 +1231,24 @@ test("agent calls run through the injected session factory and resume replays th
       ctx,
     )) as {
       content: Array<{ type: string; text: string }>;
-      details: { runId?: unknown };
+      details: WorkflowDetails;
     };
     const resumedText = resumed.content[0]!.text;
     assert.match(resumedText, /injected agent output/);
     assert.match(resumedText, /Resumed from .*replayed 1\/1 agent call/);
+    assert.match(resumedText, /replay=no-new-execution/);
+    assert.deepEqual(resumed.details.agents[0]?.completion?.replay, {
+      newExecution: false,
+      origin: journal.entries[0]?.origin,
+    });
     assert.equal(sessionCreations, 1);
+    const replayQuery = (await status.execute("e2e-replay-query", {
+      runId: resumed.details.runId,
+    })) as { details: { completions: unknown[] } };
+    assert.deepEqual(
+      replayQuery.details.completions[0],
+      resumed.details.agents[0]?.completion,
+    );
 
     const persisted = readWorkflowJson(resumed.details.runId);
     const agents = persisted.agents as Array<{
@@ -1104,6 +1343,7 @@ async function runTamperedAcceptanceReplay(
       ...existingTools,
       {
         name: structuredTool.name,
+        exposure: "direct",
         description: structuredTool.description,
         parameters: structuredTool.parameters,
         promptGuidelines: structuredTool.promptGuidelines,
@@ -1134,7 +1374,7 @@ async function runTamperedAcceptanceReplay(
         },
         new AbortController().signal,
         () => {},
-        ctx,
+        toolExecutionContext(ctx),
       );
       await prompt("fixture prompt");
     };
@@ -1145,8 +1385,8 @@ async function runTamperedAcceptanceReplay(
   const fixtureId = ++replayAcceptanceFixtureId;
   const script =
     `export const meta = { name: "acceptance-replay-${fixtureId}" };\n` +
-    'const r = await agent("verify the fixture", { agent_type: "reviewer", acceptance: { criteria: [{ id: "tests", description: "Focused tests pass", requiredEvidence: ["command"] }] } });\n' +
-    "return { ok: r.ok, error: r.error };";
+    'const r = await agent("verify the fixture", { agent_type: "bounded-reviewer", acceptance: { criteria: [{ id: "tests", description: "Focused tests pass", requiredEvidence: ["command"] }] } });\n' +
+    "return { ok: r.ok, error: r.error, acceptanceWarning: r.acceptanceWarning };";
 
   try {
     const first = (await workflow.execute(
@@ -1195,50 +1435,46 @@ const replayAcceptanceVerdicts = [
   "malformed",
 ] as const satisfies readonly ReplayAcceptanceVerdict[];
 
-// Keep the three projections independent: the script-visible result, the
-// persisted lifecycle record, and success-only filesystem side effects.
-test("replay acceptance verdicts preserve the script return contract", async () => {
+// Keep the three projections independent: the deprecated model judgment, the
+// runtime execution record, and success-only filesystem side effects.
+test("replay self-attestation verdicts do not override runtime success", async () => {
   for (const verdict of replayAcceptanceVerdicts) {
     const fixture = await runTamperedAcceptanceReplay(verdict);
     const projected = fixture.resumed.content
       .map((entry) => entry.text)
       .join("\n");
-    assert.match(projected, /"ok"\s*:\s*false/);
-    assert.match(projected, new RegExp(`Acceptance ${verdict}`));
-    if (verdict === "malformed") {
-      const error = projected.match(/Acceptance malformed[^\n]*/)?.[0] ?? "";
-      assert.ok([...error].length <= 2_000);
-      assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(error));
-    }
+    assert.match(projected, /"ok"\s*:\s*true/);
+    assert.doesNotMatch(projected, /"error"/);
+    assert.match(projected, /model self-attestation/);
   }
 });
 
-test("replay acceptance verdicts persist fail-closed runtime records", async () => {
+test("replay self-attestation remains distinct from runtime records", async () => {
   for (const verdict of replayAcceptanceVerdicts) {
     const { agents, sessionCreations } =
       await runTamperedAcceptanceReplay(verdict);
     assert.equal(sessionCreations, 1);
     assert.equal(agents.length, 1);
-    assert.equal(agents[0]?.state, "error");
-    assert.equal(agents[0]?.replayed, undefined);
-    assert.equal(agents[0]?.invocation?.admissionState, "rejected");
+    assert.equal(agents[0]?.state, "done");
+    assert.equal(agents[0]?.replayed, true);
+    assert.equal(agents[0]?.invocation?.admissionState, "replayed");
     assert.equal(agents[0]?.invocation?.executionState, "settled");
-    assert.equal(agents[0]?.invocation?.outcome, "error");
+    assert.equal(agents[0]?.invocation?.outcome, "success");
     assert.equal(agents[0]?.acceptance?.status, verdict);
-    assert.match(String(agents[0]?.error), new RegExp(`Acceptance ${verdict}`));
-    assert.equal(agents[0]?.resultArtifact, undefined);
-    assert.equal(agents[0]?.resultRef, undefined);
+    assert.equal(agents[0]?.error, undefined);
+    assert.equal(typeof agents[0]?.resultArtifact, "string");
+    assert.equal(typeof agents[0]?.resultRef, "string");
   }
 });
 
-test("replay acceptance verdicts do not create success filesystem side effects", async () => {
+test("replayed runtime successes retain artifacts despite self-attestation", async () => {
   for (const verdict of replayAcceptanceVerdicts) {
     const { runDir } = await runTamperedAcceptanceReplay(verdict);
     assert.equal(
       existsSync(join(runDir, "agent-results/agent-0001.json")),
-      false,
+      true,
     );
-    assert.equal(existsSync(join(runDir, "journal.json")), false);
+    assert.equal(existsSync(join(runDir, "journal.json")), true);
   }
 });
 
@@ -1265,6 +1501,7 @@ test("structured agent results survive handoff refs and downstream inputs", asyn
       ...existingTools,
       {
         name: structuredTool.name,
+        exposure: "direct",
         description: structuredTool.description,
         parameters: structuredTool.parameters,
         promptGuidelines: structuredTool.promptGuidelines,
@@ -1288,7 +1525,7 @@ test("structured agent results survive handoff refs and downstream inputs", asyn
         { verdict: "accepted", score: 7 },
         new AbortController().signal,
         () => {},
-        ctx,
+        toolExecutionContext(ctx),
       );
     };
     return { session };
@@ -1301,8 +1538,8 @@ test("structured agent results survive handoff refs and downstream inputs", asyn
       {
         script:
           'export const meta = { name: "structured-handoff" };\n' +
-          'const first = await agent("produce a verdict", { agent_type: "reviewer", schema: { type: "object", properties: { verdict: { type: "string" }, score: { type: "number" } }, required: ["verdict", "score"] } });\n' +
-          'const second = await agent("consume the upstream verdict", { agent_type: "reviewer", inputs: [first.ref] });\n' +
+          'const first = await agent("produce a verdict", { agent_type: "bounded-reviewer", schema: { type: "object", properties: { verdict: { type: "string" }, score: { type: "number" } }, required: ["verdict", "score"] } });\n' +
+          'const second = await agent("consume the upstream verdict", { agent_type: "bounded-reviewer", inputs: [first.ref] });\n' +
           "return { firstOk: first.ok, firstRef: first.ref ?? null, secondOk: second.ok, secondOutput: second.output };",
         wait: true,
       },
@@ -1360,6 +1597,7 @@ test("oversized authoritative agent results fail without a success record", asyn
       ...existingTools,
       {
         name: structuredTool.name,
+        exposure: "direct",
         description: structuredTool.description,
         parameters: structuredTool.parameters,
         promptGuidelines: structuredTool.promptGuidelines,
@@ -1383,7 +1621,7 @@ test("oversized authoritative agent results fail without a success record", asyn
         { blob: "x".repeat(3 * 1024 * 1024) },
         new AbortController().signal,
         () => {},
-        ctx,
+        toolExecutionContext(ctx),
       );
     };
     return { session };
@@ -1396,7 +1634,7 @@ test("oversized authoritative agent results fail without a success record", asyn
       {
         script:
           'export const meta = { name: "oversized-agent-result" };\n' +
-          'const r = await agent("return a large fixture", { agent_type: "reviewer", schema: { type: "object", properties: { blob: { type: "string" } }, required: ["blob"] } });\n' +
+          'const r = await agent("return a large fixture", { agent_type: "bounded-reviewer", schema: { type: "object", properties: { blob: { type: "string" } }, required: ["blob"] } });\n' +
           "return { ok: r.ok, error: r.error };",
         wait: true,
       },
@@ -1441,7 +1679,7 @@ test("an oversized legacy replay is rejected without a success record", async ()
   __setWorkflowTestAgentSessionFactory(factory);
   const script =
     'export const meta = { name: "oversized-replay" };\n' +
-    'const r = await agent("replay fixture", { agent_type: "reviewer" });\n' +
+    'const r = await agent("replay fixture", { agent_type: "bounded-reviewer" });\n' +
     "return { ok: r.ok, error: r.error };";
 
   try {
@@ -1517,7 +1755,7 @@ test("extension retention stays bounded and reports evictions under settled-run 
   });
   const script =
     'export const meta = { name: "retention-pressure" };\n' +
-    'const r = await agent("pressure fixture", { agent_type: "reviewer", label: "pressure-agent" });\n' +
+    'const r = await agent("pressure fixture", { agent_type: "bounded-reviewer", label: "pressure-agent" });\n' +
     'log("pressure log: " + r.output);\n' +
     "return { ok: r.ok, output: r.output };";
 
@@ -1579,6 +1817,8 @@ test("extension retention stays bounded and reports evictions under settled-run 
 });
 
 test("forced settlement persists worktree cleanup that finishes later", async () => {
+  const selectedRepo = join(agentDir, "worktree-source");
+  execFileSync("git", ["clone", "--quiet", repoDir, selectedRepo]);
   modelIdle = true;
   for (const handler of handlers.get("agent_settled") ?? []) {
     await handler({}, ctx);
@@ -1617,6 +1857,7 @@ test("forced settlement persists worktree cleanup that finishes later", async ()
       activeRun = run;
     },
     async reclaimWorktree(repoCwd, worktree) {
+      assert.equal(repoCwd, selectedRepo);
       markCleanupStarted();
       await cleanupGate;
       actualCleanup = await reclaimWorktree(repoCwd, worktree);
@@ -1630,7 +1871,9 @@ test("forced settlement persists worktree cleanup that finishes later", async ()
       {
         script:
           'export const meta = { name: "forced-worktree-cleanup" };\n' +
-          'await agent("finish in isolation", { agent_type: "reviewer", isolation: "worktree" });\n' +
+          'await agent("finish in isolation", { agent_type: "bounded-reviewer", isolation: "worktree", working_dir: ' +
+          JSON.stringify(selectedRepo) +
+          " });\n" +
           "return true;",
         background: true,
       },
@@ -1715,4 +1958,659 @@ test.after(() => {
   }
   rmSync(agentDir, { recursive: true, force: true });
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test("built-in Workflow children inherit active shell/network tools in the selected cwd without replay", async () => {
+  const previousTools = [...activeTools];
+  activeTools = [...activeTools, "bash", "fixture_network", "subagent_spawn"];
+  const alternate = join(agentDir, "alternate");
+  const targetExtensions = join(alternate, ".pi", "extensions");
+  mkdirSync(targetExtensions, { recursive: true });
+  const targetExtension = join(targetExtensions, "target.ts");
+  writeFileSync(
+    targetExtension,
+    'export default function () { throw new Error("untrusted target extension loaded"); }',
+  );
+  const calls: Array<{ cwd: string; tools: readonly string[] | undefined }> =
+    [];
+  __setWorkflowTestAgentSessionFactory(async (options) => {
+    assert.ok(options);
+    assert.ok(options.resourceLoader);
+    assert.equal(
+      options.resourceLoader
+        .getExtensions()
+        .errors.some((error) =>
+          JSON.stringify(error).includes("untrusted target extension"),
+        ),
+      false,
+    );
+    assert.equal(
+      options.resourceLoader
+        .getExtensions()
+        .extensions.some((extension) => extension.path === targetExtension),
+      false,
+    );
+    calls.push({ cwd: options.cwd!, tools: options.tools });
+    const session = fakeAgentSession("alternate output");
+    session.getActiveToolNames = () => ["read", "bash", "fixture_network"];
+    session.getAllTools = () =>
+      ["read", "bash", "fixture_network"].map((name) => ({
+        name,
+      })) as ReturnType<AgentSession["getAllTools"]>;
+    return { session };
+  });
+  const script = `return await agent("inspect", { agent_type: "explorer", working_dir: ${JSON.stringify(relative(repoDir, alternate))} });`;
+  try {
+    const first = (await workflow.execute(
+      "cwd-inherit",
+      { script, wait: true },
+      undefined,
+      undefined,
+      { ...ctx, isProjectTrusted: () => true },
+    )) as { details: { runId: string } };
+    assert.equal(calls[0]?.cwd, alternate);
+    assert.deepEqual(calls[0]?.tools, ["read", "bash", "fixture_network"]);
+    assert.equal(
+      existsSync(join(runDirFor(first.details.runId), "journal.json")),
+      false,
+    );
+    await workflow.execute(
+      "cwd-inherit-resume",
+      { script, wait: true, resume_from_run_id: first.details.runId },
+      undefined,
+      undefined,
+      { ...ctx, isProjectTrusted: () => true },
+    );
+    assert.equal(calls.length, 2);
+    for (const working_dir of ["", 42, join(alternate, "missing")]) {
+      await workflow.execute(
+        "cwd-invalid",
+        {
+          script: `return await agent("inspect", { working_dir: ${JSON.stringify(working_dir)} });`,
+          wait: true,
+        },
+        undefined,
+        undefined,
+        { ...ctx, isProjectTrusted: () => true },
+      );
+    }
+    assert.equal(calls.length, 2, "invalid cwd must not create child sessions");
+  } finally {
+    activeTools = previousTools;
+    __setWorkflowTestAgentSessionFactory(undefined);
+  }
+});
+
+test("Workflow entry tolerates inherited misses but rejects a missing explicit role tool before prompting", async () => {
+  const previousTools = [...activeTools];
+  activeTools = [...activeTools, "parent_fixture"];
+  let prompts = 0;
+  __setWorkflowTestAgentSessionFactory(async (options) => {
+    assert.deepEqual(options?.tools, ["read", "parent_fixture"]);
+    const session = fakeAgentSession(
+      "inherited surface narrowed",
+      undefined,
+      () => {
+        prompts++;
+      },
+    );
+    session.getActiveToolNames = () => ["read"];
+    session.getAllTools = () =>
+      [{ name: "read" }] as ReturnType<AgentSession["getAllTools"]>;
+    return { session };
+  });
+  try {
+    const inherited = (await workflow.execute(
+      "inherited-miss",
+      { script: 'return await agent("inspect");', wait: true },
+      undefined,
+      undefined,
+      ctx,
+    )) as { details: { runId: string } };
+    const inheritedRun = readWorkflowJson(inherited.details.runId);
+    assert.equal(
+      (inheritedRun.agents as { state: string }[])[0]?.state,
+      "done",
+    );
+    assert.equal(prompts, 1);
+
+    const explicit = (await workflow.execute(
+      "explicit-miss",
+      {
+        script:
+          'return await agent("inspect", { agent_type: "explicit-parent-fixture" });',
+        wait: true,
+      },
+      undefined,
+      undefined,
+      ctx,
+    )) as { details: { runId: string } };
+    const explicitRun = readWorkflowJson(explicit.details.runId);
+    const agent = (
+      explicitRun.agents as { state: string; error?: string }[]
+    )[0];
+    assert.equal(agent?.state, "error");
+    assert.match(
+      agent?.error ?? "",
+      /Child tool preflight failed: requested tool "parent_fixture" is unavailable/,
+    );
+    assert.equal(prompts, 1, "an explicit miss must fail before prompting");
+  } finally {
+    activeTools = previousTools;
+    __setWorkflowTestAgentSessionFactory(undefined);
+  }
+});
+
+for (const dirty of [false, true])
+  test(`cancellation during worktree creation ${dirty ? "preserves dirty work" : "reclaims the checkout"}`, {
+    skip: process.platform === "win32",
+  }, async () => {
+    const marker = join(agentDir, `checkout-hook-entered-${dirty}`);
+    const release = join(agentDir, `checkout-hook-release-${dirty}`);
+    const hook = join(repoDir, ".git", "hooks", "post-checkout");
+    writeFileSync(
+      hook,
+      `#!/bin/sh\n${dirty ? "printf evidence > cancellation-evidence.txt\n" : ""}touch '${marker}'\ni=0\nwhile [ ! -f '${release}' ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n`,
+    );
+    (await import("node:fs")).chmodSync(hook, 0o755);
+    let run:
+      | Parameters<typeof shutdownActiveWorkflowRuns>[0][number]
+      | undefined;
+    __setWorkflowTestLifecycleHooks({
+      onRunStarted(value) {
+        run = value;
+      },
+    });
+    try {
+      const launch = (await workflow.execute(
+        "cancel-checkout",
+        {
+          script: 'return await agent("probe", { isolation: "worktree" });',
+          background: true,
+        },
+        undefined,
+        undefined,
+        ctx,
+      )) as { details: { runId: string } };
+      await waitFor(() => existsSync(marker), "checkout hook");
+      await workflowStop.execute("cancel-checkout-stop", {
+        runId: launch.details.runId,
+      });
+      writeFileSync(release, "");
+      assert.ok(run);
+      await run.completion;
+      const listing = execFileSync("git", ["worktree", "list", "--porcelain"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      });
+      assert.equal((listing.match(/^worktree /gm) ?? []).length, dirty ? 2 : 1);
+      const agent = (
+        readWorkflowJson(launch.details.runId).agents as Array<
+          Record<string, unknown>
+        >
+      )[0];
+      assert.equal(
+        (agent?.worktreeCleanup as { removed?: boolean })?.removed,
+        !dirty,
+      );
+      if (dirty) {
+        assert.equal(typeof agent?.worktreePath, "string");
+        assert.equal(
+          readFileSync(
+            join(String(agent?.worktreePath), "cancellation-evidence.txt"),
+            "utf8",
+          ),
+          "evidence",
+        );
+      } else assert.equal(agent?.worktreeBranch, undefined);
+    } finally {
+      writeFileSync(release, "");
+      if (run) await run.completion;
+      rmSync(hook, { force: true });
+      __setWorkflowTestLifecycleHooks(undefined);
+    }
+  });
+
+test("Workflow agent inherits real parent package provenance and excludes intercom", async () => {
+  const packageDir = join(agentDir, "local-intercom-fixture");
+  mkdirSync(packageDir, { recursive: true });
+  writeFileSync(
+    join(packageDir, "package.json"),
+    JSON.stringify({
+      name: "pi-intercom",
+      version: "0.0.0",
+      pi: { extensions: ["./index.ts"] },
+    }),
+  );
+  writeFileSync(
+    join(packageDir, "index.ts"),
+    `export default function (pi) {
+    pi.registerTool({ name: "intercom", label: "fixture", description: "fixture",
+      parameters: { type: "object", properties: {} },
+      async execute() { return { content: [{ type: "text", text: "ok" }] }; }
+    });
+  }`,
+  );
+  const settingsPath = join(agentDir, "settings.json");
+  const previousSettings = existsSync(settingsPath)
+    ? readFileSync(settingsPath)
+    : undefined;
+  const previousTools = [...activeTools];
+  const previousGetAllTools = pi.getAllTools;
+  let parent: AgentSession | undefined;
+  let prompts = 0;
+  try {
+    writeFileSync(settingsPath, JSON.stringify({ packages: [packageDir] }));
+    const settingsManager = SettingsManager.create(repoDir, agentDir);
+    const loader = new DefaultResourceLoader({
+      cwd: repoDir,
+      agentDir,
+      settingsManager,
+    });
+    await loader.reload();
+    ({ session: parent } = await createAgentSession({
+      cwd: repoDir,
+      agentDir,
+      resourceLoader: loader,
+      settingsManager,
+      sessionManager: SessionManager.inMemory(repoDir),
+    }));
+    await parent.bindExtensions({ mode: "print" });
+    parent.setActiveToolsByName(["read", "intercom"]);
+    const parentSession = parent;
+    activeTools = parentSession.getActiveToolNames();
+    pi.getAllTools = () => parentSession.getAllTools();
+    __setWorkflowTestAgentSessionFactory(async (options) => {
+      assert.deepEqual(options?.tools, ["read"]);
+      assert.equal(
+        options?.resourceLoader
+          ?.getExtensions()
+          .extensions.some((extension) => extension.tools.has("intercom")),
+        false,
+      );
+      return {
+        session: fakeAgentSession(
+          "intercom boundary verified",
+          undefined,
+          () => prompts++,
+        ),
+      };
+    });
+    const result = (await workflow.execute(
+      "intercom-inherit",
+      {
+        script: 'return await agent("inspect", { agent_type: "explorer" });',
+        wait: true,
+      },
+      undefined,
+      undefined,
+      ctx,
+    )) as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /intercom boundary verified/);
+    assert.equal(prompts, 1);
+    assert.deepEqual(parentSession.getActiveToolNames(), ["read", "intercom"]);
+  } finally {
+    __setWorkflowTestAgentSessionFactory(undefined);
+    pi.getAllTools = previousGetAllTools;
+    activeTools = previousTools;
+    if (parent) await shutdownAndDisposeChildSession(parent);
+    if (previousSettings) writeFileSync(settingsPath, previousSettings);
+    else rmSync(settingsPath, { force: true });
+  }
+});
+
+async function printDeliveryFixture(
+  manager = SessionManager.inMemory(repoDir),
+) {
+  const localTools = new Map<string, CapturedTool>();
+  const localHandlers = new Map<
+    string,
+    Array<(event: unknown, ctx: ExtensionContext) => unknown>
+  >();
+  const messages: SentMessage[] = [];
+  let idle = true;
+  let closed = false;
+  let closedReads = 0;
+  let failures = 0;
+  const localCtx = {
+    ...ctx,
+    mode: "print",
+    hasUI: false,
+    get sessionManager() {
+      if (closed) closedReads++;
+      assert.equal(closed, false, "disposed delivery context was read");
+      return manager;
+    },
+    isIdle: () => idle,
+    ui: new Proxy(ctx.ui, {
+      get() {
+        assert.fail("print delivery accessed TUI UI");
+      },
+    }),
+  } as ExtensionContext;
+  workflows({
+    ...pi,
+    registerTool(tool: CapturedTool) {
+      localTools.set(tool.name, tool);
+    },
+    on(event: string, handler: unknown) {
+      localHandlers.set(event, [
+        ...(localHandlers.get(event) ?? []),
+        handler as (event: unknown, ctx: ExtensionContext) => unknown,
+      ]);
+      return () => {
+        localHandlers.set(
+          event,
+          (localHandlers.get(event) ?? []).filter((item) => item !== handler),
+        );
+      };
+    },
+    sendMessage(message: SentMessage["message"], options: unknown) {
+      if (failures > 0) {
+        failures--;
+        throw new Error("print fixture send failure");
+      }
+      messages.push({ message, options });
+    },
+  } as unknown as ExtensionAPI);
+  const emit = async (event: string, context = localCtx) => {
+    for (const handler of localHandlers.get(event) ?? [])
+      await handler({}, context);
+  };
+  await emit("session_start");
+  return {
+    ctx: localCtx,
+    tools: localTools,
+    emit,
+    messages,
+    setIdle(value: boolean) {
+      idle = value;
+    },
+    failSends(count: number) {
+      failures = count;
+    },
+    closeContext() {
+      closed = true;
+    },
+    closedReads: () => closedReads,
+  };
+}
+
+for (const busy of [false, true]) {
+  test(`native print interrupted inline completion delivers once after parent busy=${busy}`, async () => {
+    const fixture = await printDeliveryFixture();
+    fixture.setIdle(!busy);
+    let release = () => {};
+    let started = false;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    __setWorkflowTestAgentSessionFactory(async () => ({
+      session: fakeAgentSession("native print completion", gate, () => {
+        started = true;
+      }),
+    }));
+    try {
+      const controller = new AbortController();
+      const execution = Promise.resolve(
+        fixture.tools.get("workflow")!.execute(
+          "native-print",
+          {
+            script:
+              'return await agent("native print", { agent_type: "bounded-reviewer" });',
+            wait: true,
+          },
+          controller.signal,
+          undefined,
+          fixture.ctx,
+        ),
+      );
+      await waitFor(() => started, "native print child started");
+      controller.abort();
+      let runId: string | undefined;
+      await assert.rejects(execution, (error: unknown) => {
+        runId = String(error).match(/run (wf_[0-9a-f]+)/u)?.[1];
+        return /continues in the background/u.test(String(error));
+      });
+      assert.ok(runId);
+      release();
+      await waitFor(
+        () => readWorkflowJson(runId).status === "completed",
+        "native print worker completed",
+      );
+      if (busy) {
+        await waitFor(
+          () =>
+            (readWorkflowJson(runId).delivery as { state: string }).state ===
+            "pending",
+          "busy delivery retained",
+        );
+        assert.equal(fixture.messages.length, 0);
+        fixture.setIdle(true);
+        await fixture.emit("agent_settled");
+      }
+      await waitFor(
+        () => fixture.messages.length === 1,
+        "native print follow-up",
+        1500,
+      );
+      assert.deepEqual(fixture.messages[0]!.options, {
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+      assert.equal(
+        (readWorkflowJson(runId).delivery as { state: string }).state,
+        "delivered",
+      );
+      await fixture.emit("agent_settled");
+      await fixture.emit("agent_settled");
+      assert.equal(fixture.messages.length, 1);
+    } finally {
+      release();
+      __setWorkflowTestAgentSessionFactory(undefined);
+      await fixture.emit("session_shutdown");
+    }
+  });
+}
+
+for (const replacement of [
+  "different-session",
+  "same-id-new-manager",
+  "changed-id-same-manager",
+] as const) {
+  test(`print late completion cannot acquire ${replacement} ownership`, async () => {
+    const manager = SessionManager.inMemory(repoDir);
+    const originalId = manager.getSessionId();
+    const fixture = await printDeliveryFixture(manager);
+    let release = () => {};
+    let started = false;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    __setWorkflowTestAgentSessionFactory(async () => ({
+      session: fakeAgentSession("old print owner", gate, () => {
+        started = true;
+      }),
+    }));
+    try {
+      const abort = new AbortController();
+      const execution = Promise.resolve(
+        fixture.tools.get("workflow")!.execute(
+          "old-owner",
+          {
+            script:
+              'return await agent("old owner", { agent_type: "bounded-reviewer" });',
+            wait: true,
+          },
+          abort.signal,
+          undefined,
+          fixture.ctx,
+        ),
+      );
+      await waitFor(() => started, "old owner child");
+      abort.abort();
+      let runId: string | undefined;
+      await assert.rejects(execution, (error: unknown) => {
+        runId = String(error).match(/run (wf_[0-9a-f]+)/u)?.[1];
+        return Boolean(runId);
+      });
+      const next =
+        replacement === "changed-id-same-manager"
+          ? manager
+          : SessionManager.inMemory(repoDir);
+      if (replacement === "same-id-new-manager")
+        next.getSessionId = () => originalId;
+      if (replacement === "changed-id-same-manager")
+        next.getSessionId = () => "replacement-session";
+      // No session_start for same-id/new-manager: a stale lazy context cannot
+      // authorize it. Other cases install the new native lifecycle owner.
+      if (replacement !== "same-id-new-manager") {
+        await fixture.emit("session_start", {
+          ...fixture.ctx,
+          sessionManager: next,
+        });
+      } else {
+        Object.defineProperty(fixture.ctx, "sessionManager", {
+          get: () => next,
+        });
+      }
+      if (replacement === "different-session") {
+        await fixture.tools
+          .get("workflow")!
+          .execute(
+            "late-old-tool",
+            { script: "return true;", wait: true },
+            undefined,
+            undefined,
+            fixture.ctx,
+          );
+      }
+      release();
+      await waitFor(
+        () => readWorkflowJson(runId).status === "completed",
+        "old completion terminal",
+      );
+      await fixture.emit("agent_settled");
+      assert.equal(fixture.messages.length, 0);
+      assert.equal(
+        (readWorkflowJson(runId).delivery as { state: string }).state,
+        "pending",
+      );
+    } finally {
+      release();
+      __setWorkflowTestAgentSessionFactory(undefined);
+      await fixture.emit("session_shutdown");
+    }
+  });
+}
+
+test("print reload restores a failed canonical delivery without reviving a disposed context", async () => {
+  const manager = SessionManager.inMemory(repoDir);
+  const fixture = await printDeliveryFixture(manager);
+  fixture.failSends(2);
+  let release = () => {};
+  let started = false;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  __setWorkflowTestAgentSessionFactory(async () => ({
+    session: fakeAgentSession("print reload", gate, () => {
+      started = true;
+    }),
+  }));
+  let runId: string | undefined;
+  try {
+    const abort = new AbortController();
+    const execution = Promise.resolve(
+      fixture.tools.get("workflow")!.execute(
+        "print-reload",
+        {
+          script:
+            'return await agent("reload", { agent_type: "bounded-reviewer" });',
+          wait: true,
+        },
+        abort.signal,
+        undefined,
+        fixture.ctx,
+      ),
+    );
+    await waitFor(() => started, "reload child");
+    abort.abort();
+    await assert.rejects(execution, (error: unknown) => {
+      runId = String(error).match(/run (wf_[0-9a-f]+)/u)?.[1];
+      return Boolean(runId);
+    });
+    release();
+    await waitFor(
+      () =>
+        (readWorkflowJson(runId).delivery as { attempts: number }).attempts ===
+        1,
+      "failed print send",
+    );
+    await fixture.emit("session_shutdown");
+    fixture.closeContext();
+    assert.equal(fixture.messages.length, 0);
+    assert.equal(
+      (readWorkflowJson(runId).delivery as { state: string }).state,
+      "pending",
+    );
+    const restoredManager = SessionManager.inMemory(repoDir);
+    restoredManager.getSessionId = () => manager.getSessionId();
+    const restored = await printDeliveryFixture(restoredManager);
+    try {
+      await waitFor(
+        () => restored.messages.length === 1,
+        "restored print completion",
+      );
+      assert.equal(
+        (readWorkflowJson(runId).delivery as { state: string }).state,
+        "delivered",
+      );
+      await fixture.emit("agent_settled");
+      await restored.emit("agent_settled");
+      assert.equal(fixture.closedReads(), 0);
+      assert.equal(restored.messages.length, 1);
+    } finally {
+      await restored.emit("session_shutdown");
+    }
+  } finally {
+    release();
+    __setWorkflowTestAgentSessionFactory(undefined);
+  }
+});
+
+test("native print keeps normal inline consumption and rejects direct detached launch", async () => {
+  const fixture = await printDeliveryFixture();
+  try {
+    const tool = fixture.tools.get("workflow")!;
+    const result = (await tool.execute(
+      "print-inline-only",
+      { script: "return { inline: true };" },
+      undefined,
+      undefined,
+      fixture.ctx,
+    )) as AgentToolResult<WorkflowDetails>;
+    assert.equal(result.details.background, false);
+    assert.equal(result.details.delivery?.state, "consumed-inline");
+    const before = readdirSync(join(agentDir, "workflows")).sort();
+    for (const input of [{ wait: false }, { background: true }]) {
+      await assert.rejects(
+        Promise.resolve(
+          tool.execute(
+            "print-detached-rejected",
+            { script: "return true;", ...input },
+            undefined,
+            undefined,
+            fixture.ctx,
+          ),
+        ),
+        /cannot deliver.*wait: true/iu,
+      );
+    }
+    assert.deepEqual(readdirSync(join(agentDir, "workflows")).sort(), before);
+    await fixture.emit("agent_settled");
+    assert.equal(fixture.messages.length, 0);
+  } finally {
+    await fixture.emit("session_shutdown");
+  }
 });

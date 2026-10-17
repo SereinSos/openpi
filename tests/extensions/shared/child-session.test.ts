@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { toolExecutionContext } from "../../support/extension-tool-context.ts";
 import {
   mkdir,
   mkdtemp,
@@ -15,10 +16,18 @@ import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+} from "@earendil-works/pi-ai";
+import {
   createAgentSession,
+  createSyntheticSourceInfo,
   DefaultPackageManager,
   DefaultResourceLoader,
   defineTool,
+  type ExtensionContext,
+  ModelRuntime,
   ProjectTrustStore,
   SessionManager,
   type SessionShutdownEvent,
@@ -34,6 +43,7 @@ import {
   createChildResources,
   type DisposableChildSession,
   effectiveChildToolAllowlist,
+  inheritedChildToolAllowlist,
   resolveGitInfoPathOrThrow,
   resolveStandaloneChildProjectTrust,
   shutdownAndDisposeChildSession,
@@ -66,6 +76,12 @@ test("effective child allowlists never advertise parent-only tools", () => {
     excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
   });
 });
+
+/** Built-in and inline extensions carry synthetic paths that `realpath` rejects. */
+const realpathExtension = (extensionPath: string) =>
+  extensionPath.startsWith("builtin:") || extensionPath.startsWith("<")
+    ? Promise.resolve(extensionPath)
+    : realpath(extensionPath);
 
 test("explicit child tools are checked against the final bound registry", async () => {
   await withTempDir(async (directory) => {
@@ -137,6 +153,107 @@ test("explicit child tools are checked against the final bound registry", async 
   });
 });
 
+test("SDK children register inherited Pi built-ins without admitting unrelated tools", async () => {
+  await withTempDir(async (cwd) => {
+    const agentDir = path.join(cwd, "agent");
+    const requested = ["read", "codemode", "tool_search"];
+    const resources = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: false,
+    });
+    assert.deepEqual(resources.loader.getExtensions().errors, []);
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      resourceLoader: resources.loader,
+      settingsManager: resources.settingsManager,
+      sessionManager: SessionManager.inMemory(cwd),
+      ...childToolPolicy(requested),
+    });
+    try {
+      await bindChildSessionExtensions(session, requested);
+      assert.deepEqual(
+        session.getActiveToolNames().sort(),
+        [...requested].sort(),
+      );
+      assert.deepEqual(
+        session
+          .getAllTools()
+          .map(({ name }) => name)
+          .sort(),
+        [...requested].sort(),
+      );
+    } finally {
+      await shutdownAndDisposeChildSession(session);
+    }
+  });
+});
+
+test("child preflight reads Pi's actual active surface after a rejected activation", async () => {
+  await withTempDir(async (cwd) => {
+    const agentDir = path.join(cwd, "agent");
+    const settingsManager = SettingsManager.inMemory();
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+      extensionFactories: [
+        {
+          name: "hidden-fixture",
+          factory(pi) {
+            pi.registerTool({
+              name: "hidden_fixture_tool",
+              label: "Hidden fixture",
+              description: "Pi cannot activate this tool",
+              exposure: "hidden",
+              parameters: Type.Object({}),
+              async execute() {
+                return {
+                  content: [{ type: "text", text: "fixture" }],
+                  details: {},
+                };
+              },
+            });
+          },
+        },
+      ],
+    });
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const requested = ["hidden_fixture_tool"];
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      settingsManager,
+      resourceLoader: loader,
+      sessionManager: SessionManager.inMemory(cwd),
+      ...childToolPolicy(requested),
+    });
+    try {
+      assert.equal(session.getAllTools()[0]?.name, requested[0]);
+      await assert.rejects(
+        bindChildSessionExtensions(session, requested),
+        /Child tool preflight failed: requested tool "hidden_fixture_tool" is unavailable/,
+      );
+      assert.deepEqual(session.getActiveToolNames(), []);
+      assert.deepEqual(session.getCallableToolNames(), []);
+      assert.equal(
+        session.messages.length,
+        0,
+        "reject before the first prompt",
+      );
+      await bindChildSessionExtensions(session, requested, {
+        tolerateInheritedMisses: true,
+      });
+      assert.deepEqual(session.getActiveToolNames(), []);
+      assert.deepEqual(session.getCallableToolNames(), []);
+    } finally {
+      await shutdownAndDisposeChildSession(session);
+    }
+  });
+});
+
 test("child binding restores only requested child-safe package tools after parent surface gating", async () => {
   await withTempDir(async (directory) => {
     const settingsManager = SettingsManager.inMemory(undefined, {
@@ -204,6 +321,141 @@ test("child binding restores only requested child-safe package tools after paren
   });
 });
 
+test("Pi nested tool calls preserve child exclusions, allowlists, and permission hooks", async (t) => {
+  for (const exposure of ["codemode", "deferred"] as const) {
+    await t.test(exposure, async () => {
+      await withTempDir(async (directory) => {
+        const agentDir = path.join(directory, "agent");
+        const settingsManager = SettingsManager.inMemory(
+          {
+            retry: { enabled: false },
+            compaction: { enabled: false },
+          },
+          { projectTrusted: false },
+        );
+        const provider = fauxProvider({
+          provider: `child-nested-${exposure}`,
+          models: [{ id: "fixture", name: "Fixture", reasoning: false }],
+        });
+        provider.setResponses([
+          fauxAssistantMessage(
+            fauxToolCall("child_probe", {}, { id: "probe" }),
+            { stopReason: "toolUse" },
+          ),
+          fauxAssistantMessage("Finished the child tool check."),
+        ]);
+        const modelRuntime = await ModelRuntime.create({
+          authPath: path.join(agentDir, "auth.json"),
+          modelsPath: path.join(agentDir, "models.json"),
+          refreshOnCreate: false,
+        });
+        modelRuntime.registerNativeProvider(provider.provider);
+        await modelRuntime.setRuntimeApiKey(
+          provider.provider.id,
+          "fixture-key",
+        );
+        const calls: string[] = [];
+        const outcomes: boolean[] = [];
+        const nestedHooks: string[] = [];
+        const tools = ["child_probe", "child_read", "blocked_read"];
+        const loader = new DefaultResourceLoader({
+          cwd: directory,
+          agentDir,
+          settingsManager,
+          noSkills: true,
+          noPromptTemplates: true,
+          extensionFactories: [
+            (pi) => {
+              for (const name of [
+                "bg_start",
+                "outside_allowlist",
+                "child_read",
+                "blocked_read",
+              ]) {
+                pi.registerTool({
+                  name,
+                  label: name,
+                  description: name,
+                  exposure:
+                    name === "bg_start" || name === "outside_allowlist"
+                      ? exposure
+                      : "direct",
+                  parameters: Type.Object({}),
+                  async execute() {
+                    calls.push(name);
+                    return {
+                      content: [{ type: "text", text: "ok" }],
+                      details: {},
+                    };
+                  },
+                });
+              }
+              pi.on("tool_call", (event) => {
+                if (event.parentToolCallId) nestedHooks.push(event.toolName);
+                if (event.toolName === "blocked_read")
+                  return { block: true, reason: "fixture permission" };
+                return undefined;
+              });
+              pi.registerTool({
+                name: "child_probe",
+                label: "Child Probe",
+                description: "Probe nested child tools",
+                parameters: Type.Object({}),
+                async execute(_id, _args, _signal, _update, ctx) {
+                  for (const name of [
+                    "child_read",
+                    "bg_start",
+                    "outside_allowlist",
+                    "blocked_read",
+                  ]) {
+                    const outcome = await ctx.executeTool(name, {});
+                    outcomes.push(outcome.isError);
+                  }
+                  return {
+                    content: [{ type: "text", text: "checked" }],
+                    details: {},
+                  };
+                },
+              });
+            },
+          ],
+        });
+        await loader.reload();
+        const { session } = await createAgentSession({
+          cwd: directory,
+          agentDir,
+          settingsManager,
+          resourceLoader: loader,
+          model: provider.getModel(),
+          modelRuntime,
+          sessionManager: SessionManager.inMemory(directory),
+          ...childToolPolicy(tools),
+        });
+        try {
+          await bindChildSessionExtensions(session, tools);
+          session.setActiveToolsByName([
+            ...tools,
+            "bg_start",
+            "outside_allowlist",
+          ]);
+          assert.deepEqual(
+            session.getCallableToolNames().sort(),
+            [...tools].sort(),
+          );
+          assert.equal(session.getToolDefinition("bg_start"), undefined);
+          await session.prompt("Check the child authority boundary.");
+          assert.deepEqual(outcomes, [false, true, true, true]);
+          assert.deepEqual(calls, ["child_read"]);
+          assert.ok(nestedHooks.includes("child_read"));
+          assert.ok(nestedHooks.includes("blocked_read"));
+        } finally {
+          await shutdownAndDisposeChildSession(session);
+        }
+      });
+    });
+  }
+});
+
 test("child resources remove only verified parent-only OpenPI extensions", async () => {
   await withTempDir(async (directory) => {
     const cwd = path.join(directory, "project");
@@ -237,6 +489,20 @@ test("child resources remove only verified parent-only OpenPI extensions", async
     const extensions = loader.getExtensions().extensions;
 
     assert.equal(
+      extensions.some((extension) =>
+        extension.path.endsWith("/web-search/index.ts"),
+      ),
+      false,
+      "native hosted search must not bypass child tool authority",
+    );
+    assert.equal(
+      extensions.some((extension) =>
+        extension.path.endsWith("/setup/index.ts"),
+      ),
+      false,
+      "parent response preferences and setup writer must not reach child Sessions",
+    );
+    assert.equal(
       extensions.some((extension) => extension.tools.has("openpi_load_tools")),
       false,
       "parent-only OpenPI extension should not reach the child runtime",
@@ -256,6 +522,60 @@ test("child resources remove only verified parent-only OpenPI extensions", async
       true,
       "ordinary third-party extensions must survive tool-name collisions",
     );
+  });
+});
+
+test("headless children preserve Pi shellPath through display extension startup", async () => {
+  await withTempDir(async (directory) => {
+    const cwd = path.join(directory, "project");
+    const agentDir = path.join(directory, "agent");
+    const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+    const missingShell = path.join(directory, "missing-shell");
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify({ shellPath: missingShell, packages: [repoRoot] }),
+    );
+
+    const { loader, settingsManager } = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: true,
+    });
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      resourceLoader: loader,
+      settingsManager,
+      sessionManager: SessionManager.inMemory(cwd),
+      ...childToolPolicy(["bash"]),
+    });
+
+    try {
+      await bindChildSessionExtensions(session, ["bash"]);
+      const bash = session.getToolDefinition("bash");
+      assert.ok(bash);
+      const context = {
+        cwd,
+        sessionManager: {
+          getSessionId: () => "shell-path",
+          getSessionFile: () => undefined,
+        },
+      } as unknown as ExtensionContext;
+      await assert.rejects(
+        bash.execute(
+          "shell-path",
+          { command: "printf should-not-run" },
+          undefined,
+          undefined,
+          toolExecutionContext(context),
+        ),
+        /Custom shell path not found/,
+      );
+    } finally {
+      await shutdownAndDisposeChildSession(session);
+    }
   });
 });
 
@@ -832,6 +1152,76 @@ test("child resources exclude pi-intercom npm, Git, and local packages without m
     for (const marker of executionMarkers) {
       assert.equal(await readFile(marker, "utf8"), "executed");
     }
+
+    // Exercise inheritance with Pi's actual parent metadata, including the
+    // nested single-file package and an unrelated tool also named intercom.
+    const parentLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir, {
+        projectTrusted: true,
+      }),
+    });
+    await parentLoader.reload();
+    const { session: parent } = await createAgentSession({
+      cwd,
+      agentDir,
+      resourceLoader: parentLoader,
+      sessionManager: SessionManager.inMemory(cwd),
+    });
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      await parent.bindExtensions({ mode: "print" });
+      const parentTools = parent.getActiveToolNames();
+      for (const name of packageToolNames)
+        assert.ok(parentTools.includes(name));
+      const options = { cwd, availableTools: parent.getAllTools() };
+      const inherited = inheritedChildToolAllowlist(
+        parentTools,
+        undefined,
+        options,
+      );
+      for (const name of packageToolNames)
+        assert.equal(inherited.includes(name), false);
+      assert.ok(
+        inherited.includes("intercom"),
+        "unrelated same-name tool survives",
+      );
+      assert.ok(inherited.includes("ordinary_manifestless"));
+      assert.ok(inherited.includes("project_intercom_path_fixture"));
+      assert.deepEqual(
+        inheritedChildToolAllowlist(
+          parentTools,
+          ["read", "intercom_single_file"],
+          options,
+        ),
+        ["read"],
+      );
+      const { session: child } = await createAgentSession({
+        cwd,
+        agentDir,
+        resourceLoader: trusted.loader,
+        settingsManager: trusted.settingsManager,
+        sessionManager: SessionManager.inMemory(cwd),
+        ...childToolPolicy(inherited),
+      });
+      try {
+        await bindChildSessionExtensions(child, inherited);
+        assert.deepEqual(
+          child.getActiveToolNames().sort(),
+          [...inherited].sort(),
+        );
+        assert.deepEqual(parent.getActiveToolNames(), parentTools);
+      } finally {
+        await shutdownAndDisposeChildSession(child);
+      }
+    } finally {
+      await shutdownAndDisposeChildSession(parent);
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    }
   });
 });
 
@@ -876,7 +1266,9 @@ test("headless child resources exclude OpenPI git polling at 1/8/64 retained ses
     const topLevelPaths = await Promise.all(
       topLevelLoader
         .getExtensions()
-        .extensions.map((extension) => realpath(extension.resolvedPath)),
+        .extensions.map((extension) =>
+          realpathExtension(extension.resolvedPath),
+        ),
     );
     const topLevelPollers = topLevelPaths.filter(
       (extensionPath) => extensionPath === gitInfoPath,
@@ -891,7 +1283,9 @@ test("headless child resources exclude OpenPI git polling at 1/8/64 retained ses
     const childPaths = await Promise.all(
       child.loader
         .getExtensions()
-        .extensions.map((extension) => realpath(extension.resolvedPath)),
+        .extensions.map((extension) =>
+          realpathExtension(extension.resolvedPath),
+        ),
     );
     const childPollers = childPaths.filter(
       (extensionPath) => extensionPath === gitInfoPath,
@@ -907,7 +1301,7 @@ test("headless child resources exclude OpenPI git polling at 1/8/64 retained ses
     const childGitInfoResource = await Promise.all(
       childPackagePaths.extensions.map(async (resource) => ({
         ...resource,
-        canonicalPath: await realpath(resource.path),
+        canonicalPath: await realpathExtension(resource.path),
       })),
     ).then((resources) =>
       resources.find((resource) => resource.canonicalPath === gitInfoPath),
@@ -954,7 +1348,9 @@ test("headless child resources exclude OpenPI git polling at 1/8/64 retained ses
       const parentDirectPaths = await Promise.all(
         directLoader
           .getExtensions()
-          .extensions.map((extension) => realpath(extension.resolvedPath)),
+          .extensions.map((extension) =>
+            realpathExtension(extension.resolvedPath),
+          ),
       );
       assert.equal(
         parentDirectPaths.includes(gitInfoPath),
@@ -969,7 +1365,9 @@ test("headless child resources exclude OpenPI git polling at 1/8/64 retained ses
       const directPaths = await Promise.all(
         directChild.loader
           .getExtensions()
-          .extensions.map((extension) => realpath(extension.resolvedPath)),
+          .extensions.map((extension) =>
+            realpathExtension(extension.resolvedPath),
+          ),
       );
       assert.equal(
         directPaths.includes(gitInfoPath),
@@ -988,9 +1386,13 @@ test("headless child resources exclude OpenPI git polling at 1/8/64 retained ses
       projectTrusted: true,
     });
     assert.deepEqual(
-      disabledExtensionsChild.loader.getExtensions().extensions,
+      disabledExtensionsChild.loader
+        .getExtensions()
+        .extensions.filter(
+          (extension) => !extension.resolvedPath.startsWith("builtin:"),
+        ),
       [],
-      "an empty package extension filter must remain fully disabled",
+      "an empty package extension filter must remain fully disabled (built-ins excepted)",
     );
   });
 });
@@ -1033,7 +1435,9 @@ test("nested manifestless packages are not mistaken for OpenPI", async () => {
     const childPaths = await Promise.all(
       child.loader
         .getExtensions()
-        .extensions.map((extension) => realpath(extension.resolvedPath)),
+        .extensions.map((extension) =>
+          realpathExtension(extension.resolvedPath),
+        ),
     );
     assert.equal(childPaths.includes(await realpath(ordinaryGitInfo)), true);
   });
@@ -1047,6 +1451,8 @@ test("child package snapshot handles canonical and historical package Git source
       "git:github:nicobailon/pi-intercom@feature/test",
       "git:github.com/nicobailon/pi-intercom@feature/test",
       "git:git@github.com:nicobailon/pi-intercom@feature/test",
+      "npm:pi-web-access@0.38.0",
+      "git:github.com/nicobailon/pi-web-access@v0.38.0",
     ];
     const openPiSources = [
       "git:github.com/openpi-dev/openpi",
@@ -1096,10 +1502,64 @@ test("child package snapshot handles canonical and historical package Git source
   });
 });
 
+test("web access local package and renamed tools stay out of children before execution", async () => {
+  await withTempDir(async (directory) => {
+    const cwd = path.join(directory, "project");
+    const agentDir = path.join(directory, "agent");
+    const source = path.join(directory, "renamed-checkout");
+    const marker = path.join(directory, "executed");
+    await mkdir(cwd);
+    await mkdir(agentDir);
+    await mkdir(source);
+    await writeFile(
+      path.join(source, "package.json"),
+      JSON.stringify({
+        name: "pi-web-access",
+        version: "0.38.0",
+        pi: { extensions: ["index.ts"] },
+      }),
+    );
+    await writeFile(
+      path.join(source, "index.ts"),
+      `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "executed"); export default function () {}`,
+    );
+    const settingsPath = path.join(agentDir, "settings.json");
+    const bytes = JSON.stringify({ packages: [source] });
+    await writeFile(settingsPath, bytes);
+    const child = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: true,
+    });
+    assert.deepEqual(child.settingsManager.getGlobalSettings().packages, []);
+    await assert.rejects(readFile(marker), { code: "ENOENT" });
+    assert.equal(await readFile(settingsPath, "utf8"), bytes);
+    assert.deepEqual(
+      inheritedChildToolAllowlist(["renamed_search"], undefined, {
+        cwd,
+        availableTools: [
+          {
+            name: "renamed_search",
+            sourceInfo: {
+              path: path.join(source, "index.ts"),
+              source,
+              scope: "user",
+              origin: "package",
+              baseDir: source,
+            },
+          },
+        ],
+      }),
+      [],
+    );
+  });
+});
+
 test("unverifiable local package identities fail closed before factory execution", async () => {
   for (const fixture of [
     { directoryName: "local-package-checkout", manifest: "{ invalid json" },
     { directoryName: "pi-intercom", manifest: undefined },
+    { directoryName: "pi-web-access", manifest: undefined },
   ]) {
     await withTempDir(async (directory) => {
       const cwd = path.join(directory, "project");
@@ -1132,6 +1592,25 @@ test("unverifiable local package identities fail closed before factory execution
         /Cannot verify child package identity/,
       );
       await assert.rejects(readFile(executionMarker));
+      assert.throws(
+        () =>
+          inheritedChildToolAllowlist(["fixture"], undefined, {
+            cwd,
+            availableTools: [
+              {
+                name: "fixture",
+                sourceInfo: {
+                  path: path.join(packageDir, "extensions", "index.ts"),
+                  source: packageDir,
+                  baseDir: packageDir,
+                  scope: "user",
+                  origin: "package",
+                },
+              },
+            ],
+          }),
+        /Cannot verify child package identity/,
+      );
     });
   }
 });
@@ -1497,5 +1976,44 @@ test("git-info exclusion: ENOENT degrades, other errors fail closed", async () =
       }),
     (error: unknown) => (error as NodeJS.ErrnoException).code === "EACCES",
     "non-ENOENT realpath failures must fail closed",
+  );
+});
+
+test("child delegation inherits active tools and custom restrictions only narrow", () => {
+  const parent = ["read", "bash", "web_search", "workflow", "subagent_spawn"];
+  const options = {
+    cwd: process.cwd(),
+    availableTools: parent.map((name) => ({
+      name,
+      sourceInfo: createSyntheticSourceInfo(`<sdk:${name}>`, { source: "sdk" }),
+    })),
+  };
+  assert.deepEqual(inheritedChildToolAllowlist(parent, undefined, options), [
+    "read",
+    "bash",
+    "web_search",
+  ]);
+  assert.deepEqual(
+    inheritedChildToolAllowlist(
+      parent,
+      ["read", "rg", "web_search", "workflow"],
+      options,
+    ),
+    ["read", "web_search"],
+  );
+  assert.deepEqual(inheritedChildToolAllowlist(parent, [], options), []);
+  assert.deepEqual(inheritedChildToolAllowlist([], ["bash"], options), []);
+  assert.throws(
+    () => inheritedChildToolAllowlist(["missing"], undefined, options),
+    /Cannot verify child tool provenance/,
+  );
+  assert.throws(
+    () =>
+      inheritedChildToolAllowlist(["read"], undefined, {
+        cwd: process.cwd(),
+        // Verify the runtime boundary even if a broken caller violates Pi's type.
+        availableTools: [{ name: "read", sourceInfo: undefined! }],
+      }),
+    /Cannot verify child package identity/,
   );
 });

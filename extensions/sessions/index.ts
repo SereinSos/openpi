@@ -47,9 +47,9 @@ import {
   type PreviewBlock,
   type PreviewMessageLike,
   parseLimit,
-  selectSessionStatsWindow,
   type SessionInfoLike,
   type SessionPreview,
+  selectSessionStatsWindow,
 } from "./sessions.js";
 
 const DEFAULT_VISIBLE = 12;
@@ -312,7 +312,6 @@ const formatItemLabel = (
   statsState: SessionStatsState | undefined,
 ): string => {
   const itemWidth = width - 4;
-  const timeStr = formatRelativeTime(session.modified);
 
   const stats = statsState?.status === "ready" ? statsState.stats : undefined;
   let statsStr = "";
@@ -337,6 +336,12 @@ const formatItemLabel = (
     statsLen = 1;
   }
 
+  const timeWidth = itemWidth - 5 - (statsLen > 0 ? statsLen + 3 : 1);
+  const timeStr = formatRelativeTime(
+    session.modified,
+    new Date(),
+    Math.max(0, timeWidth),
+  );
   const title = buildSessionLabel(session);
   const reserved = 1 + timeStr.length + (statsLen > 0 ? statsLen + 2 : 0);
   const titleWidth = Math.max(5, itemWidth - reserved);
@@ -773,11 +778,28 @@ async function showSessionPicker(
         }
       };
 
+      const renderFilter = (width: number) => {
+        const border = (text: string) =>
+          theme.fg(focus === "list" ? "accent" : "borderMuted", text);
+        const prefix = "⌕ [ ";
+        const suffix = " ]";
+        const value = truncateToWidth(
+          filter || "type to filter",
+          Math.max(0, width - visibleWidth(prefix + suffix)),
+        );
+        return [
+          truncateToWidth(
+            border(prefix) +
+              theme.fg(filter ? "text" : "muted", value) +
+              border(suffix),
+            width,
+          ),
+          theme.fg("borderMuted", "─".repeat(Math.max(0, width))),
+        ];
+      };
+
       const renderSinglePane = (width: number): string[] => {
         const container = new Container();
-        const filterLine = filter.length
-          ? `${theme.fg("muted", "Filter: ")}${theme.fg("text", filter)}`
-          : `${theme.fg("muted", "Filter: ")}${theme.fg("dim", "type to filter")}`;
 
         container.addChild(
           new DynamicBorder((text: string) => theme.fg("accent", text)),
@@ -785,7 +807,9 @@ async function showSessionPicker(
         container.addChild(
           new Text(theme.fg("accent", theme.bold("Sessions")), 1, 0),
         );
-        container.addChild(new Text(filterLine, 1, 0));
+        container.addChild(
+          new Text(renderFilter(Math.max(0, width - 2)).join("\n"), 1, 0),
+        );
         if (isLoading) {
           container.addChild(new Spacer(1));
           container.addChild(
@@ -793,9 +817,23 @@ async function showSessionPicker(
           );
           container.addChild(new Spacer(1));
         } else {
+          // Frame, title, two filter rows and hints occupy six rows. Native
+          // SelectList adds a scroll indicator when its item window is clipped.
+          const listHeight = Math.max(
+            1,
+            Math.max(12, tui.terminal?.rows ?? 24) - 6,
+          );
+          const requestedVisible = Math.min(
+            maxVisible,
+            Math.max(filteredEntries.length, 1),
+          );
+          const scrollRows =
+            filteredEntries.length > Math.min(requestedVisible, listHeight)
+              ? 1
+              : 0;
           const effectiveVisible = Math.max(
             1,
-            Math.min(maxVisible, Math.max(filteredEntries.length, 1)),
+            Math.min(requestedVisible, listHeight - scrollRows),
           );
           ensureStatsWindowLoad(effectiveVisible);
           const items = buildItems(filteredEntries, width);
@@ -806,7 +844,11 @@ async function showSessionPicker(
               theme.fg(focus === "list" ? "accent" : "muted", text),
             description: (text) => theme.fg("muted", text),
             scrollInfo: (text) => theme.fg("dim", text),
-            noMatch: () => theme.fg("warning", "  No matching sessions"),
+            noMatch: () =>
+              theme.fg(
+                "warning",
+                truncateToWidth("  No matching sessions", width),
+              ),
           });
           const selectedIndex = filteredEntries.findIndex(
             (entry) => entry.session.path === selectedPath,
@@ -866,20 +908,22 @@ async function showSessionPicker(
         const termRows = Math.max(12, tui.terminal?.rows ?? 24);
         // Frame (2) + hint line (1).
         const contentHeight = Math.max(8, termRows - 3);
-        const filterLine = filter.length
-          ? `${theme.fg("muted", "Filter: ")}${theme.fg("text", filter)}`
-          : `${theme.fg("muted", "Filter: ")}${theme.fg("dim", "type to filter")}`;
-        const listHeight = Math.max(1, contentHeight - 1);
+        const filterRows = renderFilter(layout.listWidth);
+        const listHeight = Math.max(1, contentHeight - filterRows.length);
 
         let leftLines: string[] = [];
         if (isLoading) {
-          leftLines.push(filterLine);
+          leftLines.push(...filterRows);
           leftLines.push("");
           leftLines.push(theme.fg("muted", "  Loading sessions..."));
         } else {
+          const scrollRows = filteredEntries.length > listHeight ? 1 : 0;
           const effectiveVisible = Math.max(
-            listHeight,
-            Math.min(maxVisible, Math.max(filteredEntries.length, 1)),
+            1,
+            Math.min(
+              listHeight - scrollRows,
+              Math.max(filteredEntries.length, 1),
+            ),
           );
           ensureStatsWindowLoad(effectiveVisible);
           const items = buildItems(filteredEntries, layout.listWidth);
@@ -902,7 +946,7 @@ async function showSessionPicker(
           selectList.onSelectionChange = (item) => setSelectedPath(item.value);
 
           leftLines = [
-            filterLine,
+            ...filterRows,
             ...selectList.render(layout.listWidth),
           ].slice(0, contentHeight);
         }
@@ -969,7 +1013,10 @@ async function showSessionPicker(
       return {
         render: (width) => {
           const layout = getSessionPaneLayout(width);
-          if (layout.mode === "single") return renderSinglePane(width);
+          if (layout.mode === "single") {
+            focus = "list";
+            return renderSinglePane(width);
+          }
           return renderSplitPane(width);
         },
         invalidate: () => {
@@ -981,6 +1028,13 @@ async function showSessionPicker(
         },
         dispose: disposePicker,
         handleInput: (data) => {
+          const currentLayout = getSessionPaneLayout(
+            tui.terminal?.columns ?? 80,
+          );
+          // A resize can arrive before the next render. Hidden panes must not
+          // retain focus or take it from the visible session list.
+          if (currentLayout.mode === "single") focus = "list";
+
           if (data === "\u0014" || data === "\u001bw") {
             showAllWorkspaces = !showAllWorkspaces;
             void loadWorkspaceSessions(showAllWorkspaces);
@@ -988,8 +1042,10 @@ async function showSessionPicker(
           }
 
           if (data === "\t") {
-            focus = focus === "list" ? "preview" : "list";
-            tui.requestRender();
+            if (currentLayout.mode === "split") {
+              focus = focus === "list" ? "preview" : "list";
+              tui.requestRender();
+            }
             return;
           }
           if (matchesKey(data, Key.left)) {
@@ -1000,7 +1056,7 @@ async function showSessionPicker(
             return;
           }
           if (matchesKey(data, Key.right)) {
-            if (focus === "list") {
+            if (currentLayout.mode === "split" && focus === "list") {
               focus = "preview";
               tui.requestRender();
             }
@@ -1018,9 +1074,6 @@ async function showSessionPicker(
             return;
           }
 
-          const currentLayout = getSessionPaneLayout(
-            tui.terminal?.columns ?? 80,
-          );
           if (currentLayout.mode === "split" && focus === "preview") {
             // t/h toggle the preview's tool/thinking visibility. They only
             // belong to the preview pane; when the list is focused they must

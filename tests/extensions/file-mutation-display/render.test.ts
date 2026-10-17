@@ -65,7 +65,7 @@ const fixtures: Array<{
       content: [{ type: "text", text: "one\ntwo" }],
       details: undefined,
     },
-    success: /Read\s+src\/long-file\.ts:10-29/,
+    success: /Read\s+src[\\/]long-file\.ts:10-29/,
   },
   {
     name: "bash",
@@ -170,6 +170,8 @@ function renderCollapsed(
     toolCallId: "call-1",
     invalidate() {},
     lastComponent: undefined,
+    durationMs: undefined,
+    outputPad: 0,
     state,
     cwd,
     executionStarted: true,
@@ -410,6 +412,8 @@ test("expanded mode delegates call and result to Pi native renderers", () => {
       toolCallId: "call-expanded",
       invalidate() {},
       lastComponent: undefined,
+      durationMs: undefined,
+      outputPad: 0,
       state,
       cwd,
       executionStarted: true,
@@ -448,5 +452,29 @@ test("expanded mode delegates call and result to Pi native renderers", () => {
           .render(100)
       : [];
     assert.deepEqual(actualResult, expectedResult, `${fixture.name} result`);
+  }
+});
+
+test("collapsed labels encode newlines before ANSI-aware width clipping", () => {
+  for (const fixture of fixtures) {
+    const args = { ...fixture.args, path: "合法\nfile.txt" };
+    for (const width of [12, 24, 160]) {
+      for (const status of ["pending", "success", "error"]) {
+        const lines = renderCollapsed(
+          withActivityRenderer(fixture.definition),
+          args,
+          status === "pending" ? undefined : fixture.result,
+          status === "error",
+          width,
+          ansiTheme,
+        );
+        assert.equal(lines.length, 1, fixture.name);
+        assert.doesNotMatch(lines[0]!, /[\r\n]/, fixture.name);
+        assert.ok(visibleWidth(lines[0]!) <= width, fixture.name);
+        if (width === 160 && fixture.name !== "bash" && status === "success") {
+          assert.match(lines[0]!, /合法 ↵ file.txt/, fixture.name);
+        }
+      }
+    }
   }
 });

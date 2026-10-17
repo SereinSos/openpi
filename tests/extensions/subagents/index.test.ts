@@ -7,7 +7,10 @@ import type {
   EntryRenderer,
   ExtensionAPI,
   ExtensionContext,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
+import { encodeStructuredResult } from "../../../extensions/shared/structured-output.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { PLAN_MODE_CHANNEL } from "../../../extensions/shared/plan-mode-state.ts";
 import subagents, {
@@ -15,6 +18,24 @@ import subagents, {
   truncatedOutput,
 } from "../../../extensions/subagents/index.ts";
 import { projectResult } from "../../../extensions/subagents/src/result-artifact.ts";
+import {
+  delegationCompletionText,
+  projectDelegationCompletion,
+} from "../../../extensions/shared/delegation-completion.ts";
+
+import {
+  type AgentSession,
+  createAgentSession,
+  createSyntheticSourceInfo,
+  DefaultResourceLoader,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import { shutdownAndDisposeChildSession } from "../../../extensions/shared/child-session.ts";
+import { makePiBackend } from "../../../extensions/subagents/src/backends/pi.ts";
+import { __setSubagentTestBackends } from "../../../extensions/subagents/src/runtime.ts";
+import { createPiAgentSessionHarness } from "../../support/pi-agent-session-harness.ts";
+import { toolExecutionContext } from "../../support/extension-tool-context.ts";
 
 initTheme("dark", false);
 
@@ -54,6 +75,13 @@ test("subagent results render before the hidden wake-up message", () => {
     },
   ]);
 
+  const completion = projectDelegationCompletion({
+    owner: "direct",
+    referenceKind: "fingerprint",
+    outcome: "uncertain",
+    effectiveCwd: process.cwd(),
+    isolation: "shared",
+  });
   assert.deepEqual(events, [
     {
       kind: "entry",
@@ -65,6 +93,7 @@ test("subagent results render before the hidden wake-up message", () => {
           title: "investigate plan mode",
           status: "done",
           elapsed: "1s",
+          completion,
         },
       },
     },
@@ -72,14 +101,14 @@ test("subagent results render before the hidden wake-up message", () => {
       kind: "message",
       message: {
         customType: "subagent-result",
-        content:
-          'Subagent sa-3 "investigate plan mode" finished.\n\nreport\n\n(This result is already shown to the user. Act on it and relay only the decisions or next steps — do not repeat it verbatim.)',
+        content: `Subagent sa-3 "investigate plan mode" finished.\n\nreport\n\n${delegationCompletionText(completion)}\n\n(This result is already shown to the user. Act on it and relay only the decisions or next steps — do not repeat it verbatim.)`,
         display: false,
         details: {
           id: "sa-3",
           title: "investigate plan mode",
           status: "done",
           elapsed: "1s",
+          completion,
           displayContent:
             'Subagent sa-3 "investigate plan mode" finished.\n\nreport',
         },
@@ -87,6 +116,146 @@ test("subagent results render before the hidden wake-up message", () => {
       options: { deliverAs: "followUp", triggerTurn: true },
     },
   ]);
+});
+
+test("automatic delivery exposes structured data and its canonical artifact", () => {
+  let entry: { content: string; details: Record<string, unknown> } | undefined;
+  let sent: { content: string } | undefined;
+  const pi = {
+    appendEntry(
+      _customType: string,
+      data: { content: string; details: Record<string, unknown> },
+    ) {
+      entry = data;
+    },
+    sendMessage(message: { content: string }) {
+      sent = message;
+    },
+  } as unknown as ExtensionAPI;
+  const dispatch = createSubagentResultDispatcher(pi);
+  dispatch([
+    {
+      id: "sa-structured",
+      origin: "model",
+      backend: "pi",
+      title: "structured review",
+      prompt: "review",
+      cwd: process.cwd(),
+      status: "done",
+      outcome: "completed",
+      createdAt: 0,
+      settledAt: 1_000,
+      meta: {
+        backend: "pi",
+        sessionFilePath: "/Users/private-host/.pi/child.jsonl",
+      },
+      usage: {},
+      transcriptVersion: 0,
+      transcript: [],
+      liveTools: [],
+      queued: [],
+      finalText: "",
+      structuredResult: {
+        value: { verdict: "pass" },
+        json: '{"verdict":"pass"}',
+        byteLength: 18,
+        artifactPath: "/tmp/structured.json",
+      },
+      turns: 1,
+    },
+  ]);
+
+  assert.match(entry?.content ?? "", /\{"verdict":"pass"\}/);
+  assert.deepEqual(entry?.details.structured, { verdict: "pass" });
+  assert.equal(entry?.details.structuredArtifactPath, "/tmp/structured.json");
+  assert.ok(sent);
+  assert.equal(
+    sent.content.includes("/Users/private-host/.pi/child.jsonl"),
+    false,
+  );
+  assert.equal(sent.content.includes("/tmp/structured.json"), false);
+});
+
+test("automatic delivery keeps large structured values in runtime details, not parent model text", () => {
+  const findings = "x".repeat(80 * 1024);
+  const value = { findings };
+  const encoded = encodeStructuredResult(value);
+  let persisted = "";
+  let sent: { content: string; details: Record<string, unknown> } | undefined;
+  const pi = {
+    appendEntry() {},
+    sendMessage(message: {
+      content: string;
+      details: Record<string, unknown>;
+    }) {
+      sent = message;
+    },
+  } as unknown as ExtensionAPI;
+  const dispatch = createSubagentResultDispatcher(pi, (snap, maxBytes) =>
+    truncatedOutput(snap, maxBytes, (content) => {
+      persisted = content;
+      return "/tmp/structured-full.json";
+    }),
+  );
+
+  dispatch([
+    {
+      id: "sa-structured-large",
+      origin: "model",
+      backend: "pi",
+      title: "structured review",
+      prompt: "review",
+      cwd: process.cwd(),
+      status: "done",
+      outcome: "completed",
+      createdAt: 0,
+      settledAt: 1_000,
+      meta: { backend: "pi" },
+      usage: {},
+      transcriptVersion: 0,
+      transcript: [],
+      liveTools: [],
+      queued: [],
+      finalText: "",
+      structuredResult: {
+        ...encoded,
+        artifactPath: "/tmp/structured-full.json",
+      },
+      turns: 1,
+    },
+  ]);
+
+  assert.ok(sent);
+  assert.equal(persisted, encoded.json);
+  assert.deepEqual(sent.details.structured, value);
+  assert.equal(
+    sent.details.structuredArtifactPath,
+    "/tmp/structured-full.json",
+  );
+  assert.ok(Buffer.byteLength(sent.content, "utf8") < encoded.byteLength);
+  assert.equal(sent.content.includes(findings), false);
+
+  const llm = convertToLlm([
+    {
+      role: "custom",
+      customType: "subagent-result",
+      content: sent.content,
+      display: false,
+      details: sent.details,
+      timestamp: Date.now(),
+    },
+  ]);
+  const llmText = llm
+    .flatMap((message) =>
+      Array.isArray(message.content)
+        ? message.content
+            .filter((block) => block.type === "text")
+            .map((block) => block.text)
+        : [],
+    )
+    .join("");
+  assert.equal(llmText, sent.content);
+  assert.equal(JSON.stringify(llm).includes(findings), false);
 });
 
 test("automatic result projection keeps both ends and persists the exact final answer", () => {
@@ -878,5 +1047,281 @@ test("session_start re-registers agent types for its cwd and live trust decision
         ),
       /agent type "inherited-tools" would be narrowed to capabilities that contradict its unchanged prompt/,
     );
+  });
+});
+
+test("ordinary and typed Direct spawns inherit real single-file package provenance", async () => {
+  await withTempDir(async (cwd) => {
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    const packageDir = path.join(agentDir, "local-package-checkout");
+    const source = path.join(packageDir, "extensions", "intercom.ts");
+    await mkdir(path.dirname(source), { recursive: true });
+    await writeFile(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "pi-intercom", version: "0.0.0" }),
+    );
+    await writeFile(
+      source,
+      `export default function (pi) {
+      pi.registerTool({ name: "intercom", label: "fixture", description: "fixture",
+        parameters: { type: "object", properties: {} },
+        async execute() { return { content: [{ type: "text", text: "ok" }] }; }
+      });
+    }`,
+    );
+    await writeFile(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify({ packages: [source] }),
+    );
+    const settingsManager = SettingsManager.create(cwd, agentDir);
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+    });
+    await loader.reload();
+    const { session: parent } = await createAgentSession({
+      cwd,
+      agentDir,
+      resourceLoader: loader,
+      settingsManager,
+      sessionManager: SessionManager.inMemory(cwd),
+    });
+    const model = {
+      provider: "fixture",
+      id: "model",
+      name: "fixture",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:1",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 8192,
+      maxTokens: 100,
+    } as NonNullable<AgentSession["model"]>;
+    let prompts = 0;
+    __setSubagentTestBackends([
+      makePiBackend({
+        sessionFactory: async (options) => {
+          assert.deepEqual(options?.tools, ["read"]);
+          assert.equal(
+            options?.resourceLoader
+              ?.getExtensions()
+              .extensions.some((extension) => extension.tools.has("intercom")),
+            false,
+          );
+          const harness = createPiAgentSessionHarness({
+            model,
+            activeTools: ["read"],
+            prompt: async (_text, child) => {
+              prompts++;
+              child.emitAssistant("intercom boundary verified");
+            },
+          });
+          return { session: harness.session };
+        },
+      }),
+    ]);
+    const tools = new Map<
+      string,
+      { execute: (...args: unknown[]) => Promise<unknown> }
+    >();
+    const hooks = new Map<string, (...args: unknown[]) => unknown>();
+    const pi = {
+      events: { on() {}, emit() {} },
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, handler);
+      },
+      registerTool(tool: {
+        name: string;
+        execute: (...args: unknown[]) => Promise<unknown>;
+      }) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      registerEntryRenderer() {},
+      appendEntry() {},
+      sendMessage() {},
+      setActiveTools() {},
+      getActiveTools: () => parent.getActiveToolNames(),
+      getAllTools: () => parent.getAllTools(),
+      getThinkingLevel: () => "off",
+    } as unknown as ExtensionAPI;
+    const ctx = {
+      cwd,
+      hasUI: false,
+      isProjectTrusted: () => false,
+      model,
+      getContextUsage: () => undefined,
+      modelRegistry: { find: () => model, getAll: () => [model] },
+    } as unknown as ExtensionContext;
+    try {
+      await parent.bindExtensions({ mode: "print" });
+      parent.setActiveToolsByName(["read", "intercom"]);
+      subagents(pi);
+      for (const agent_type of [undefined, "advisor"]) {
+        const spawned = (await tools.get("subagent_spawn")!.execute(
+          "spawn",
+          {
+            prompt: "inspect",
+            name: agent_type ?? "ordinary",
+            ...(agent_type ? { agent_type } : {}),
+          },
+          undefined,
+          undefined,
+          ctx,
+        )) as { details: { id: string } };
+        const waited = await tools
+          .get("subagent_wait")!
+          .execute(
+            "wait",
+            { ids: [spawned.details.id] },
+            undefined,
+            undefined,
+            ctx,
+          );
+        assert.match(JSON.stringify(waited), /intercom boundary verified/);
+        const queried = await tools
+          .get("subagent_check")!
+          .execute("check", { id: spawned.details.id });
+        const waitedProjection = waited as {
+          details: { results: Array<{ completion: unknown }> };
+        };
+        const queriedProjection = queried as {
+          details: { completion: unknown };
+        };
+        assert.deepEqual(
+          queriedProjection.details.completion,
+          waitedProjection.details.results[0]?.completion,
+        );
+        assert.match(JSON.stringify(waited), /verification=unknown/);
+        assert.deepEqual(parent.getActiveToolNames(), ["read", "intercom"]);
+      }
+      assert.equal(prompts, 2);
+    } finally {
+      await hooks.get("session_shutdown")?.({}, ctx);
+      __setSubagentTestBackends(undefined);
+      await shutdownAndDisposeChildSession(parent);
+    }
+  });
+});
+
+test("Direct spawn tolerates inherited misses but rejects a missing explicit role tool before prompting", async () => {
+  await withTempDir(async (cwd) => {
+    const agentDir = process.env.PI_CODING_AGENT_DIR!;
+    await mkdir(path.join(agentDir, "agents"), { recursive: true });
+    await writeFile(
+      path.join(agentDir, "agents", "explicit-fixture.md"),
+      "---\nname: explicit-fixture\ndescription: Requires a parent-only fixture\ntools: [read, parent_fixture]\n---\nUse parent_fixture to verify the result.\n",
+    );
+    const model = {
+      provider: "fixture",
+      id: "model",
+      name: "fixture",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:1",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 8192,
+      maxTokens: 100,
+    } as NonNullable<AgentSession["model"]>;
+    let prompts = 0;
+    __setSubagentTestBackends([
+      makePiBackend({
+        sessionFactory: async (options) => {
+          assert.deepEqual(options?.tools, ["read", "parent_fixture"]);
+          const harness = createPiAgentSessionHarness({
+            model,
+            activeTools: ["read"],
+            prompt: async (_text, child) => {
+              prompts++;
+              child.emit({ type: "agent_start" });
+              const message = child.emitAssistant("inherited surface narrowed");
+              child.emit({
+                type: "agent_end",
+                messages: [message],
+                willRetry: false,
+              });
+              child.emit({ type: "agent_settled", ...{ aborted: false } });
+            },
+          });
+          return { session: harness.session };
+        },
+      }),
+    ]);
+    const tools = new Map<string, ToolDefinition>();
+    const hooks = new Map<string, (...args: unknown[]) => unknown>();
+    const pi = {
+      events: { on() {}, emit() {} },
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, handler);
+      },
+      registerTool(tool: ToolDefinition) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      registerEntryRenderer() {},
+      appendEntry() {},
+      sendMessage() {},
+      setActiveTools() {},
+      getActiveTools: () => ["read", "parent_fixture"],
+      getAllTools: () =>
+        ["read", "parent_fixture"].map((name) => ({
+          name,
+          sourceInfo: createSyntheticSourceInfo(`<sdk:${name}>`, {
+            source: "sdk",
+          }),
+        })),
+      getThinkingLevel: () => "off",
+    } as unknown as ExtensionAPI;
+    const ctx = {
+      cwd,
+      hasUI: false,
+      isProjectTrusted: () => false,
+      model,
+      getContextUsage: () => undefined,
+      modelRegistry: { find: () => model, getAll: () => [model] },
+      sessionManager: SessionManager.inMemory(cwd),
+    } as unknown as ExtensionContext;
+    const toolCtx = toolExecutionContext(ctx);
+    try {
+      subagents(pi);
+      await hooks.get("session_start")?.({}, ctx);
+      const spawn = tools.get("subagent_spawn")!;
+      const inherited = await spawn.execute(
+        "inherited",
+        { prompt: "inspect", name: "inherited" },
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      const id = (inherited.details as { id: string }).id;
+      const waited = await tools
+        .get("subagent_wait")!
+        .execute("wait", { ids: [id] }, undefined, undefined, toolCtx);
+      assert.match(JSON.stringify(waited), /inherited surface narrowed/);
+      assert.equal(prompts, 1);
+      await assert.rejects(
+        spawn.execute(
+          "explicit",
+          {
+            prompt: "inspect",
+            name: "explicit",
+            agent_type: "explicit-fixture",
+          },
+          undefined,
+          undefined,
+          toolCtx,
+        ),
+        /Child tool preflight failed: requested tool "parent_fixture" is unavailable/,
+      );
+      assert.equal(prompts, 1, "an explicit miss must fail before prompting");
+    } finally {
+      await hooks.get("session_shutdown")?.({}, ctx);
+      __setSubagentTestBackends(undefined);
+    }
   });
 });

@@ -10,10 +10,8 @@
  * imperative TUI components (which render synchronously) can read snapshots
  * and issue fire-and-forget commands without touching the Effect runtime.
  *
- * Every run is guarded by a first-response watchdog: a provider that accepts
- * the request but never emits its first assistant event is settled as a
- * failure (releasing its concurrency slot) instead of hanging forever,
- * mirroring the workflow runner's watchdog.
+ * Pi owns provider transport timeouts and retries. This manager owns explicit
+ * cancellation, settlement, and bounded cleanup, not model-output deadlines.
  */
 
 import {
@@ -28,6 +26,11 @@ import {
 } from "effect";
 import type { SubagentBackend, SubagentSession } from "./backend.ts";
 import type { AgentToolRenderer } from "../../shared/agent-tool-renderer.ts";
+import type {
+  ChildExecutionAdmission,
+  ChildExecutionLease,
+  ChildExecutionAdmissionSnapshot,
+} from "../../shared/child-execution-admission.ts";
 import { BackendRegistry } from "./backend.ts";
 import type {
   BackendName,
@@ -60,13 +63,6 @@ export const MAX_TRACKED = 64;
 const STOP_TIMEOUT_MS = 5_000;
 /** Session abort/shutdown (5s) plus bounded direct-worktree cleanup (4s). */
 const ENTRY_CLOSE_TIMEOUT_MS = 10_000;
-/**
- * First-response watchdog: a run whose provider accepts the request but
- * never emits an assistant event is settled as a failure so it cannot
- * occupy a concurrency slot forever. Matches the workflow runner's
- * MODEL_PROGRESS_TIMEOUT_MS (extensions/workflows/runner.ts).
- */
-export const FIRST_RESPONSE_TIMEOUT_MS = 45_000;
 const ERROR_TEXT_MAX_LENGTH = 4_096;
 const TRANSCRIPT_TEXT_MAX_LENGTH = 64 * 1_024;
 const LIVE_ASSISTANT_MAX_LENGTH = 128 * 1_024;
@@ -75,10 +71,6 @@ const MAX_TRANSCRIPT_ITEMS = 512;
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
-}
-
-function formatWatchdogTimeout(ms: number) {
-  return ms % 1_000 === 0 ? `${ms / 1_000} seconds` : `${ms} ms`;
 }
 
 function boundedTranscriptText(text: string) {
@@ -110,7 +102,14 @@ interface MutableSnapshot {
   cwd: string;
   status: SubagentStatus;
   outcome?: SubagentSnapshot["outcome"];
+  executionUncertain?: boolean;
   worktreeBranch?: string;
+  worktreeBaseSha?: string;
+  requestedCwd?: string;
+  runGeneration?: number;
+  completionGeneration?: number;
+  evidence?: SubagentSnapshot["evidence"];
+  runTranscriptStart: number;
   createdAt: number;
   settledAt?: number;
   errorText?: string;
@@ -123,6 +122,7 @@ interface MutableSnapshot {
   liveTools: LiveToolState[];
   queued: SubagentSnapshot["queued"];
   finalText: string;
+  structuredResult?: SubagentSnapshot["structuredResult"];
   turns: number;
 }
 
@@ -132,11 +132,13 @@ interface Entry {
   scope: Scope.Closeable;
   pump?: Fiber.Fiber<void>;
   liveToolMap: Map<string, LiveToolState>;
-  /** First-response watchdog timer for the active (or just-armed) run. */
-  watchdogTimer?: ReturnType<typeof setTimeout>;
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  admissionLease?: ChildExecutionLease;
+  admissionAbort?: AbortController;
+  /** A timed-out stop has no trustworthy terminal evidence: retain its lease. */
+  admissionUncertain?: boolean;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -148,6 +150,8 @@ export interface SubagentReadModel {
   /** Native tool projection retained by the live child session, when present. */
   getToolRenderer?(id: string): AgentToolRenderer | undefined;
   size(): number;
+  /** Shared Session admission state; no task prompts are exposed here. */
+  childExecutionAdmission?(): ChildExecutionAdmissionSnapshot | undefined;
   /** Any-change notification (footer status, dashboard). */
   subscribe(listener: () => void): () => void;
   /** Per-subagent notification (takeover view). */
@@ -213,8 +217,6 @@ export class SubagentManager extends Context.Service<
 
 const makeManager = (config: SubagentManagerConfig = {}) =>
   Effect.gen(function* () {
-    const firstResponseTimeoutMs =
-      config.firstResponseTimeoutMs ?? FIRST_RESPONSE_TIMEOUT_MS;
     const registry = yield* BackendRegistry;
     // Detached forker for sync contexts (read-model commands, pruning) that
     // preserves the manager's services instead of using the global runtime.
@@ -260,6 +262,10 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
         }
       }
     };
+    // Workflow and Direct/BTW all mutate this one Session-owned fact. Forward
+    // its changes through the existing view subscription so an already-open
+    // operator dashboard repaints without a separate counter projection.
+    const unsubscribeAdmission = config.admission?.subscribe(() => notify());
 
     /** Resolves on the next state change. Interruption unregisters the waiter. */
     const nextChange = Effect.callback<void>((resume) => {
@@ -342,8 +348,11 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
       }
     };
 
-    const settle = (entry: Entry, outcome: RunOutcome) => {
-      clearWatchdog(entry);
+    const settle = (
+      entry: Entry,
+      outcome: RunOutcome,
+      releaseAdmission = true,
+    ) => {
       const s = entry.snapshot;
       const wasRestarting = entry.restarting === true;
       entry.restarting = false;
@@ -352,17 +361,22 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
         // A cancel can clear a queued restart before RunStarted reaches the
         // manager. Its RunSettled still belongs to the new run, not the old
         // settled snapshot, so promote the lifecycle before applying it.
+        if (s.runGeneration !== undefined) s.runGeneration++;
+        s.runTranscriptStart = s.transcriptVersion;
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
       }
       s.settledAt = Date.now();
+      s.completionGeneration = s.runGeneration;
+      s.executionUncertain = !releaseAdmission;
       switch (outcome._tag) {
         case "Completed":
           s.status = "done";
           s.outcome = "completed";
           s.errorText = undefined;
           s.finalText = outcome.finalText.slice(0, FINAL_TEXT_MAX_LENGTH);
+          s.structuredResult = outcome.structuredResult;
           break;
         case "Failed":
           s.status = "error";
@@ -373,6 +387,7 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
             0,
             FINAL_TEXT_MAX_LENGTH,
           );
+          s.structuredResult = undefined;
           break;
         case "Interrupted":
           s.status = "error";
@@ -382,12 +397,18 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
             0,
             FINAL_TEXT_MAX_LENGTH,
           );
+          s.structuredResult = undefined;
           break;
       }
       s.liveAssistant = undefined;
       entry.liveToolMap.clear();
       s.liveTools = [];
       s.queued = [];
+      entry.admissionAbort = undefined;
+      if (releaseAdmission) {
+        entry.admissionLease?.release();
+        entry.admissionLease = undefined;
+      }
       const consumed = (waitInterest.get(s.id) ?? 0) > 0;
       notify(s.id);
       try {
@@ -399,56 +420,32 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
       pruneSettled();
     };
 
-    /** Stop the first-response watchdog (first response arrived / run settled). */
-    const clearWatchdog = (entry: Entry) => {
-      if (entry.watchdogTimer !== undefined) {
-        clearTimeout(entry.watchdogTimer);
-        entry.watchdogTimer = undefined;
-      }
-    };
-
-    /** Settle a run whose provider never emitted a first assistant response. */
-    const watchdogExpired = (entry: Entry) => {
-      entry.watchdogTimer = undefined;
-      if (!isBusy(entry)) return;
-      const model = entry.snapshot.meta.modelLabel;
-      settle(entry, {
-        _tag: "Failed",
-        errorText: `Agent received no assistant response event${model ? ` for ${model}` : ""} within ${formatWatchdogTimeout(firstResponseTimeoutMs)}; the provider request may be stalled. Retry the subagent.`,
-      });
-      // The stalled session cannot be trusted to abort cooperatively; dispose
-      // it like the abort-deadline path so it cannot revive into a zombie run.
-      const fiber = runDetached(
-        closeEntryScope(entry).pipe(
-          Effect.timeout(ENTRY_CLOSE_TIMEOUT_MS),
-          Effect.ignore,
-        ),
-      );
-      cleanups.add(fiber);
-      fiber.addObserver(() => cleanups.delete(fiber));
-    };
-
-    /** Arm the first-response watchdog for the entry's current run. */
-    const armWatchdog = (entry: Entry) => {
-      clearWatchdog(entry);
-      entry.watchdogTimer = setTimeout(
-        () => watchdogExpired(entry),
-        firstResponseTimeoutMs,
-      );
-    };
-
     const foldEvent = (entry: Entry, event: SubagentEvent) => {
       const s = entry.snapshot;
       switch (event._tag) {
         case "RunStarted":
+          if (event.generation !== undefined) {
+            s.runGeneration = event.generation;
+          } else if (s.status !== "running") {
+            s.runGeneration = (s.runGeneration ?? 0) + 1;
+          }
+          if (s.status !== "running") {
+            s.runTranscriptStart = s.transcriptVersion;
+          }
+          s.evidence = undefined;
           entry.restarting = false;
           s.status = "running";
           s.outcome = undefined;
+          s.executionUncertain = undefined;
           s.settledAt = undefined;
           s.errorText = undefined;
-          armWatchdog(entry);
+          s.finalText = "";
+          s.completionGeneration = undefined;
+          s.structuredResult = undefined;
           break;
         case "RunSettled":
+          if (event.notStarted) s.runGeneration = undefined;
+          s.evidence = event.evidence;
           settle(entry, event.outcome);
           return; // settle() already notified
         case "UserMessage":
@@ -458,7 +455,6 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
           });
           break;
         case "AssistantDelta": {
-          clearWatchdog(entry);
           const live = s.liveAssistant ?? { text: "", thinking: "" };
           s.liveAssistant =
             event.kind === "text"
@@ -477,7 +473,6 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
           break;
         }
         case "AssistantMessage":
-          clearWatchdog(entry);
           appendTranscript(s, {
             kind: "assistant",
             parts: event.parts.map((part) =>
@@ -552,29 +547,48 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
     const spawn = (backendName: BackendName, task: SpawnTask) =>
       Effect.gen(function* () {
         const origin: SubagentOrigin = task.origin ?? "model";
-        // Reserve synchronously (before the first yield inside doSpawn) so
-        // parallel tool calls cannot race past the pool cap.
-        yield* Effect.suspend(
-          (): Effect.Effect<void, SpawnError | ConcurrencyLimitError> => {
-            if (disposed) {
-              return new SpawnError({
-                message: "Subagent manager is shutting down.",
-              });
-            }
-            if (atPoolCapacity(origin)) {
-              return new ConcurrencyLimitError({
-                message: `Max ${poolLimit(origin)} ${
-                  origin === "btw" ? "by-the-way" : "subagent"
-                } sessions can run concurrently. Wait for one to finish before spawning another.`,
-              });
-            }
-            if (origin === "btw") reservedBtw++;
-            else reservedModel++;
-            return Effect.void;
-          },
-        );
-
+        let admissionLease: ChildExecutionLease | undefined;
+        let poolReservationHeld = false;
+        let leaseTransferred = false;
         const doSpawn = Effect.gen(function* () {
+          // Reserve synchronously before the first asynchronous operation so
+          // parallel tool calls cannot race past the pool cap.
+          yield* Effect.suspend(
+            (): Effect.Effect<void, SpawnError | ConcurrencyLimitError> => {
+              if (disposed) {
+                return new SpawnError({
+                  message: "Subagent manager is shutting down.",
+                });
+              }
+              if (atPoolCapacity(origin)) {
+                return new ConcurrencyLimitError({
+                  message: `Max ${poolLimit(origin)} ${
+                    origin === "btw" ? "by-the-way" : "subagent"
+                  } sessions can run concurrently. Wait for one to finish before spawning another.`,
+                });
+              }
+              if (origin === "btw") reservedBtw++;
+              else reservedModel++;
+              poolReservationHeld = true;
+              return Effect.void;
+            },
+          );
+          if (config.admission) {
+            admissionLease = yield* Effect.tryPromise({
+              try: (signal) =>
+                config.admission!.acquire(
+                  origin === "btw" ? "btw" : "direct",
+                  signal,
+                ),
+              catch: (error) =>
+                new SpawnError({
+                  message:
+                    error instanceof Error
+                      ? error.message
+                      : "Could not acquire a shared child execution slot.",
+                }),
+            });
+          }
           const backend: SubagentBackend | undefined =
             registry.get(backendName);
           if (!backend) {
@@ -604,9 +618,15 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
               title: task.title,
               prompt: task.prompt,
               cwd: task.cwd,
+              requestedCwd: task.worktree?.repoCwd ?? task.cwd,
+              runGeneration: 1,
+              runTranscriptStart: 0,
               status: "running",
               ...(task.worktree
-                ? { worktreeBranch: task.worktree.branch }
+                ? {
+                    worktreeBranch: task.worktree.branch,
+                    worktreeBaseSha: task.worktree.baseSha,
+                  }
                 : {}),
               createdAt: Date.now(),
               meta,
@@ -621,11 +641,10 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
             session,
             scope,
             liveToolMap: new Map(),
+            ...(admissionLease ? { admissionLease } : {}),
           };
           entries.set(id, entry);
-          // The run is live from the caller's perspective before RunStarted
-          // reaches the pump; guard that window too.
-          armWatchdog(entry);
+          leaseTransferred = true;
 
           // Pump: fold the event stream into the snapshot. Tied to the entry
           // scope, so closing the scope stops it. If the stream ends while the
@@ -635,7 +654,7 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
           ).pipe(
             Effect.ensuring(
               Effect.sync(() => {
-                if (entry.snapshot.status === "running") {
+                if (isBusy(entry)) {
                   settle(entry, {
                     _tag: "Failed",
                     errorText: "Backend event stream ended unexpectedly",
@@ -653,8 +672,11 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
         return yield* doSpawn.pipe(
           Effect.ensuring(
             Effect.sync(() => {
-              if (origin === "btw") reservedBtw--;
-              else reservedModel--;
+              if (poolReservationHeld) {
+                if (origin === "btw") reservedBtw--;
+                else reservedModel--;
+              }
+              if (!leaseTransferred) admissionLease?.release();
               notify();
             }),
           ),
@@ -690,8 +712,17 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
     const abortEntry = (entry: Entry) =>
       Effect.gen(function* () {
         if (!isBusy(entry)) return;
+        if (entry.restarting && entry.admissionAbort) {
+          // This restart is only queued at the shared admission boundary; do
+          // not call into a dormant child Session that has not started again.
+          entry.admissionAbort.abort(new Error("Subagent restart was aborted"));
+          entry.admissionAbort = undefined;
+          entry.restarting = false;
+          notify(entry.snapshot.id);
+          return;
+        }
         const graceful = yield* entry.session.interrupt.pipe(
-          Effect.timeout(STOP_TIMEOUT_MS),
+          Effect.timeout(config.stopTimeoutMs ?? STOP_TIMEOUT_MS),
           Effect.result,
         );
         if (Result.isFailure(graceful)) {
@@ -699,9 +730,14 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
           // fallback ("Backend event stream ended unexpectedly") cannot win
           // the race and report the wrong terminal reason.
           yield* Effect.sync(() => {
-            settle(entry, { _tag: "Interrupted" });
+            // The SDK did not produce terminal evidence in time. The legacy
+            // snapshot remains an error so the user sees the interruption, but
+            // admission stays held and this dormant Session cannot be revived:
+            // otherwise a timed-out stop could oversell the shared limit.
+            entry.admissionUncertain = true;
+            settle(entry, { _tag: "Interrupted" }, false);
             entry.snapshot.errorText =
-              "Abort deadline exceeded; session was force-disposed";
+              "Abort deadline exceeded; child termination is uncertain";
             notify(entry.snapshot.id);
           });
           // Bound the close like disposeAll does: a stuck backend finalizer
@@ -759,6 +795,12 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
             message: `Subagent "${id}" is no longer tracked.`,
           });
         }
+        if (entry.admissionUncertain) {
+          return new SendError({
+            message:
+              "Cannot restart this child because its session is closed and its previous termination is uncertain. End the parent Session before starting more child executions.",
+          });
+        }
         // Restarting a settled subagent occupies a running slot again, so it
         // must respect the same cap as spawn. Steering an already-running one
         // does not consume additional capacity.
@@ -776,14 +818,46 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
           // both pass the check in that window. Cleared by RunStarted/settle,
           // or here when the backend rejects the send.
           entry.restarting = true;
-          // A backend that accepts the send but never starts the run would
-          // hold the slot forever; guard the restart window the same way the
-          // spawn path guards its pre-RunStarted window.
-          armWatchdog(entry);
-          return entry.session.send(text).pipe(
+          return Effect.gen(function* () {
+            if (config.admission) {
+              const admissionAbort = new AbortController();
+              entry.admissionAbort = admissionAbort;
+              const lease = yield* Effect.tryPromise({
+                try: (signal) => {
+                  const abortForEffect = () =>
+                    admissionAbort.abort(signal.reason);
+                  signal.addEventListener("abort", abortForEffect, {
+                    once: true,
+                  });
+                  return config
+                    .admission!.acquire(
+                      origin === "btw" ? "btw" : "direct",
+                      admissionAbort.signal,
+                    )
+                    .finally(() =>
+                      signal.removeEventListener("abort", abortForEffect),
+                    );
+                },
+                catch: (error) =>
+                  new SendError({
+                    message:
+                      error instanceof Error
+                        ? error.message
+                        : "Could not acquire a shared child execution slot.",
+                  }),
+              });
+              entry.admissionAbort = undefined;
+              entry.admissionLease = lease;
+            }
+            return yield* entry.session.send(text);
+          }).pipe(
             Effect.onError(() =>
               Effect.sync(() => {
                 entry.restarting = false;
+                entry.admissionAbort?.abort();
+                entry.admissionAbort = undefined;
+                entry.admissionLease?.release();
+                entry.admissionLease = undefined;
                 notify(entry.snapshot.id);
               }),
             ),
@@ -795,8 +869,8 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
     const disposeAll = Effect.gen(function* () {
       disposed = true;
       const all = [...entries.values()];
-      for (const entry of all) clearWatchdog(entry);
       entries.clear();
+      for (const entry of all) entry.admissionAbort?.abort();
       yield* Effect.forEach(
         all,
         (entry) =>
@@ -825,6 +899,7 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
       get: (id) => entries.get(id)?.snapshot,
       getToolRenderer: (id) => entries.get(id)?.session.toolRenderer,
       size: () => entries.size,
+      childExecutionAdmission: () => config.admission?.snapshot(),
       subscribe: (listener) => {
         listeners.add(listener);
         return () => listeners.delete(listener);
@@ -858,7 +933,11 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
 
     // Safety net: disposing the ManagedRuntime tears everything down even if
     // the extension forgot to call disposeAll explicitly.
-    yield* Effect.addFinalizer(() => disposeAll);
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => unsubscribeAdmission?.()).pipe(
+        Effect.andThen(disposeAll),
+      ),
+    );
 
     return SubagentManager.of({
       spawn,
@@ -873,11 +952,13 @@ const makeManager = (config: SubagentManagerConfig = {}) =>
   });
 
 export interface SubagentManagerConfig {
-  /** Test-only override for the first-response watchdog timeout. */
-  firstResponseTimeoutMs?: number;
   /** Session-branch high-water marks restored by the extension host. */
   initialModelCounter?: number;
   initialBtwCounter?: number;
+  /** Parent-session slot owner, shared with the Workflow extension. */
+  admission?: ChildExecutionAdmission;
+  /** Test-only seam for forced-stop lifecycle coverage. */
+  stopTimeoutMs?: number;
 }
 
 export const makeSubagentManagerLayer = (config: SubagentManagerConfig = {}) =>

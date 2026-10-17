@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import { toolExecutionContext } from "../../support/extension-tool-context.ts";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import type {
   AgentSession,
   CreateAgentSessionOptions,
+  ExtensionContext,
   ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import { Effect, Layer, ManagedRuntime, Stream } from "effect";
 import type {
-  SubagentCleanupReceipt,
   SubagentBackend,
+  SubagentCleanupReceipt,
   SubagentSession,
 } from "../../../extensions/subagents/src/backend.ts";
 import { BackendRegistry } from "../../../extensions/subagents/src/backend.ts";
@@ -122,25 +127,20 @@ function harnessFactory(
   return { factory, creations, harnesses };
 }
 
-function createManagerRuntime(
-  backend: SubagentBackend,
-  firstResponseTimeoutMs = 500,
-) {
+function createManagerRuntime(backend: SubagentBackend) {
   const registry = Layer.succeed(
     BackendRegistry,
     new Map<BackendName, SubagentBackend>([["pi", backend]]),
   );
   return ManagedRuntime.make(
-    makeSubagentManagerLayer({ firstResponseTimeoutMs }).pipe(
-      Layer.provide(registry),
-    ),
+    makeSubagentManagerLayer().pipe(Layer.provide(registry)),
   );
 }
 
 async function spawnDirect(
   backend: SubagentBackend,
   spawnTask: SpawnTask,
-  drive: (session: SubagentSession) => void,
+  drive: (session: SubagentSession) => void | Promise<void>,
 ) {
   const events: SubagentEvent[] = [];
   const firstSettlement = deferred<void>();
@@ -156,7 +156,7 @@ async function spawnDirect(
             }),
           ),
         );
-        drive(session);
+        yield* Effect.promise(() => Promise.resolve(drive(session)));
         yield* Effect.promise(() => firstSettlement.promise);
       }),
     ),
@@ -204,9 +204,9 @@ test("the production Pi adapter bridges startup, first response, tools, usage, a
       harness.setContextUsage({ tokens: 321, contextWindow: 8_192 });
       harness.emitAssistant("Repository inspected");
       harness.setStreaming(false);
-      harness.emit({ type: "agent_settled" });
+      harness.emit({ type: "agent_settled", ...{ aborted: false } });
       harness.resolvePrompt();
-      harness.emit({ type: "agent_settled" });
+      harness.emit({ type: "agent_settled", ...{ aborted: false } });
     },
   );
 
@@ -257,6 +257,190 @@ test("the production Pi adapter bridges startup, first response, tools, usage, a
   assert.equal(harness.calls.disposals, 1);
 });
 
+test("native aborted settlement interrupts a child without an aborted assistant message", async () => {
+  for (const previousResult of [undefined, "stop", "error"] as const) {
+    const fixtures = harnessFactory();
+    const backend = makePiBackend({
+      sessionFactory: fixtures.factory,
+      shutdownTimeoutMs: 50,
+    });
+    const events = await spawnDirect(
+      backend,
+      task("run until interrupted"),
+      () => {
+        const harness = fixtures.harnesses[0]!;
+        harness.emit({ type: "agent_start" });
+        if (previousResult)
+          harness.emitAssistant("partial result", {
+            stopReason: previousResult,
+          });
+        harness.emit({ type: "agent_settled", ...{ aborted: true } });
+        harness.resolvePrompt();
+      },
+    );
+    assert.deepEqual(
+      events
+        .filter((event) => event._tag === "RunSettled")
+        .map((event) => event.outcome),
+      [
+        {
+          _tag: "Interrupted",
+          partialText: previousResult ? "partial result" : undefined,
+        },
+      ],
+    );
+  }
+});
+
+test("a direct subagent validates, persists, and delivers structured output", async () => {
+  const agentDir = await mkdtemp(
+    path.join(tmpdir(), "openpi-structured-child-"),
+  );
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const fixtures = harnessFactory();
+    const backend = makePiBackend({
+      sessionFactory: fixtures.factory,
+      shutdownTimeoutMs: 50,
+    });
+    const events = await spawnDirect(
+      backend,
+      task("return a verdict", {
+        outputSchema: {
+          type: "object",
+          properties: { verdict: { type: "string" } },
+          required: ["verdict"],
+          additionalProperties: false,
+        },
+      }),
+      async () => {
+        const creation = fixtures.creations[0];
+        const harness = fixtures.harnesses[0];
+        assert.ok(creation);
+        assert.ok(harness);
+        assert.deepEqual(creation.tools, ["read", "structured_output"]);
+        assert.equal(creation.customTools?.length, 1);
+        await creation.customTools?.[0]?.execute(
+          "structured",
+          { verdict: "pass" },
+          undefined,
+          undefined,
+          toolExecutionContext({} as ExtensionContext),
+        );
+        harness.setStreaming(true);
+        harness.emit({ type: "agent_start" });
+        harness.emitAssistant("");
+        harness.setStreaming(false);
+        harness.emit({ type: "agent_settled", ...{ aborted: false } });
+        harness.resolvePrompt();
+      },
+    );
+    const settled = events.find((event) => event._tag === "RunSettled");
+    assert.equal(settled?._tag, "RunSettled");
+    if (settled?._tag !== "RunSettled") return;
+    assert.equal(settled.outcome._tag, "Completed");
+    if (settled.outcome._tag !== "Completed") return;
+    assert.deepEqual(settled.outcome.structuredResult?.value, {
+      verdict: "pass",
+    });
+    const artifactPath = settled.outcome.structuredResult?.artifactPath;
+    assert.ok(artifactPath);
+    assert.equal(await readFile(artifactPath, "utf8"), '{"verdict":"pass"}');
+    assert.equal(settled.evidence?.structured.status, "saved");
+    // A content-address collision is a real persistence failure, not an
+    // execution failure. No additional model call is involved in this fixture.
+    await writeFile(artifactPath, "collision");
+    const failedSave = await spawnDirect(
+      backend,
+      task("return a verdict", { outputSchema: { type: "object" } }),
+      async () => {
+        const next = fixtures.harnesses[1];
+        await fixtures.creations[1]?.customTools?.[0]?.execute(
+          "structured",
+          { verdict: "pass" },
+          undefined,
+          undefined,
+          toolExecutionContext({} as ExtensionContext),
+        );
+        next.emit({ type: "agent_start" });
+        next.emitAssistant("done");
+        next.emit({ type: "agent_settled", ...{ aborted: false } });
+        next.resolvePrompt();
+      },
+    );
+    const storageFailure = failedSave.find(
+      (event) => event._tag === "RunSettled",
+    );
+    assert.equal(storageFailure?._tag, "RunSettled");
+    if (storageFailure?._tag === "RunSettled") {
+      assert.equal(storageFailure.outcome._tag, "Completed");
+      assert.equal(storageFailure.evidence?.structured.status, "failed");
+      assert.equal(storageFailure.evidence?.structured.path, undefined);
+    }
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("a direct structured subagent fails when it never submits", async () => {
+  const fixtures = harnessFactory();
+  const backend = makePiBackend({
+    sessionFactory: fixtures.factory,
+    shutdownTimeoutMs: 50,
+  });
+  const events = await spawnDirect(
+    backend,
+    task("forget structured output", {
+      outputSchema: { type: "object", additionalProperties: true },
+    }),
+    () => {
+      const harness = fixtures.harnesses[0];
+      assert.ok(harness);
+      harness.setStreaming(true);
+      harness.emit({ type: "agent_start" });
+      harness.emitAssistant("plain text only");
+      harness.setStreaming(false);
+      harness.emit({ type: "agent_settled", ...{ aborted: false } });
+      harness.resolvePrompt();
+    },
+  );
+  const settled = events.find((event) => event._tag === "RunSettled");
+  assert.equal(settled?._tag, "RunSettled");
+  if (settled?._tag !== "RunSettled") return;
+  assert.equal(settled.outcome._tag, "Failed");
+  if (settled.outcome._tag !== "Failed") return;
+  assert.match(settled.outcome.errorText, /without calling structured_output/);
+});
+
+test("by-the-way spawns use in-memory sessions without persisting to disk", async () => {
+  let persisted: boolean | undefined;
+  const fixtures = harnessFactory();
+  const backend = makePiBackend({
+    sessionFactory: async (options) => {
+      persisted = options?.sessionManager?.isPersisted();
+      return fixtures.factory(options);
+    },
+    shutdownTimeoutMs: 50,
+  });
+
+  await spawnDirect(
+    backend,
+    task("an ephemeral aside", { origin: "btw" }),
+    () => {
+      const harness = fixtures.harnesses[0];
+      assert.ok(harness);
+      harness.emitAssistant("answer");
+      harness.emit({ type: "agent_settled", ...{ aborted: false } });
+      harness.resolvePrompt();
+    },
+  );
+
+  assert.equal(persisted, false);
+});
+
 test("prompt rejection wins over an earlier agent_settled event", async () => {
   const prompt = deferred<void>();
   const fixtures = harnessFactory(() => ({
@@ -266,7 +450,7 @@ test("prompt rejection wins over an earlier agent_settled event", async () => {
     sessionFactory: fixtures.factory,
     shutdownTimeoutMs: 50,
   });
-  const runtime = createManagerRuntime(backend, 10_000);
+  const runtime = createManagerRuntime(backend);
   try {
     const manager = await runtime.runPromise(SubagentManager);
     const spawned = await runtime.runPromise(
@@ -278,7 +462,7 @@ test("prompt rejection wins over an earlier agent_settled event", async () => {
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("partial provider output");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
 
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(manager.view.get(spawned.id)?.status, "running");
@@ -304,7 +488,7 @@ test("a prompt that resolves without lifecycle events fails explicitly", async (
     sessionFactory: fixtures.factory,
     shutdownTimeoutMs: 50,
   });
-  const runtime = createManagerRuntime(backend, 10_000);
+  const runtime = createManagerRuntime(backend);
   try {
     const manager = await runtime.runPromise(SubagentManager);
     const spawned = await runtime.runPromise(
@@ -323,7 +507,7 @@ test("a prompt that resolves without lifecycle events fails explicitly", async (
     harness.setStreaming(true);
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("late lifecycle output");
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(manager.view.get(spawned.id)?.finalText, "");
   } finally {
@@ -389,6 +573,7 @@ test("streaming send steers while idle send starts a distinct run", async () => 
     harness.setStreaming(true);
     harness.emit({ type: "agent_start" });
     harness.emitTextDelta("first response");
+    harness.emit({ type: "agent_start" }); // provider retry, not another run
 
     await runtime.runPromise(manager.send(first.id, "steer the active run"));
     assert.deepEqual(harness.calls.steers, ["steer the active run"]);
@@ -396,10 +581,13 @@ test("streaming send steers while idle send starts a distinct run", async () => 
 
     harness.emitAssistant("first result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await runtime.runPromise(manager.waitFor([first.id]));
     assert.equal(manager.view.get(first.id)?.finalText, "first result");
+    assert.equal(manager.view.get(first.id)?.runGeneration, 1);
+    assert.equal(manager.view.get(first.id)?.evidence?.generation, 1);
+    assert.equal(manager.view.get(first.id)?.evidence?.sealed, true);
 
     await runtime.runPromise(manager.send(first.id, "second turn"));
     assert.deepEqual(harness.calls.prompts, ["first turn", "second turn"]);
@@ -408,20 +596,23 @@ test("streaming send steers while idle send starts a distinct run", async () => 
     harness.emitTextDelta("second response");
     harness.emitAssistant("second result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await runtime.runPromise(manager.waitFor([first.id]));
 
     const afterRestart = manager.view.get(first.id);
     assert.equal(afterRestart?.status, "done");
     assert.equal(afterRestart?.finalText, "second result");
+    assert.equal(afterRestart?.runGeneration, 2);
+    assert.equal(afterRestart?.evidence?.generation, 2);
+    assert.equal(afterRestart?.evidence?.sealed, true);
     assert.equal(settlements.length, 2);
     assert.deepEqual(
       settlements.map((entry) => entry.split(":", 1)[0]),
       [first.id, first.id],
     );
 
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(settlements.length, 2);
   } finally {
@@ -451,7 +642,7 @@ test("cancelled active run restarts only after the old prompt is quiescent", asy
 
     const cancellation = runtime.runPromise(manager.cancel([spawned.id]));
     await waitFor(() => harness.calls.aborts === 1, "active run abort");
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     const report = await cancellation;
     assert.equal(report[0]?.cancelled, true);
@@ -474,7 +665,7 @@ test("cancelled active run restarts only after the old prompt is quiescent", asy
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("fresh restarted result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await runtime.runPromise(manager.waitFor([spawned.id]));
     assert.equal(manager.view.get(spawned.id)?.status, "done");
@@ -563,7 +754,7 @@ test("preflight cancellation stays single-flight until the exact prompt settles"
       args: { path: "stale.txt" },
     });
     harness.emitAssistant("stale cancelled result");
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(cancelFinished, false);
     assert.equal(settlements, 0);
@@ -587,7 +778,7 @@ test("preflight cancellation stays single-flight until the exact prompt settles"
     harness.emitTextDelta("fresh delta");
     harness.emitAssistant("fresh result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     secondPrompt.resolve();
     await runtime.runPromise(manager.waitFor([spawned.id]));
 
@@ -642,7 +833,7 @@ test("settled restart waits for the previous prompt Promise microtask boundary",
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("first result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(manager.view.get(spawned.id)?.status, "running");
 
@@ -665,7 +856,7 @@ test("settled restart waits for the previous prompt Promise microtask boundary",
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("second result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     secondPrompt.resolve();
     await runtime.runPromise(manager.waitFor([spawned.id]));
     assert.equal(manager.view.get(spawned.id)?.finalText, "second result");
@@ -702,7 +893,7 @@ test("cancel invalidates a restart waiting on the previous prompt Promise", asyn
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("first result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(manager.view.get(spawned.id)?.status, "running");
 
@@ -761,7 +952,7 @@ test("an aborted send cannot start its deferred restart later", async () => {
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("stable prior result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(manager.view.get(spawned.id)?.status, "running");
 
@@ -821,7 +1012,7 @@ test("run-local terminal evidence survives preflight and post-run compaction", a
     // Post-run compaction can replace it again before agent_settled.
     harness.messages.splice(0, harness.messages.length);
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await runtime.runPromise(manager.waitFor([spawned.id]));
     assert.equal(
@@ -838,7 +1029,7 @@ test("run-local terminal evidence survives preflight and post-run compaction", a
     });
     harness.messages.splice(0, harness.messages.length);
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await runtime.runPromise(manager.waitFor([spawned.id]));
     assert.equal(manager.view.get(spawned.id)?.status, "error");
@@ -860,7 +1051,7 @@ test("run-local terminal evidence survives preflight and post-run compaction", a
     harness.messages.splice(0, harness.messages.length);
     const cancellation = runtime.runPromise(manager.cancel([spawned.id]));
     await waitFor(() => harness.calls.aborts === 1, "compacted run abort");
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await cancellation;
     assert.equal(manager.view.get(spawned.id)?.status, "error");
@@ -896,7 +1087,7 @@ test("cancelled restart preflight never reuses the previous run output", async (
     harness.emit({ type: "agent_start" });
     harness.emitAssistant("previous successful result");
     harness.setStreaming(false);
-    harness.emit({ type: "agent_settled" });
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
     harness.resolvePrompt();
     await runtime.runPromise(manager.waitFor([spawned.id]));
     assert.equal(
@@ -945,7 +1136,7 @@ test("a preflight that ignores abort is force-closed without reopening the sessi
       throw new Error("unsafe worktree cleanup should not run");
     },
   });
-  const runtime = createManagerRuntime(backend, 10_000);
+  const runtime = createManagerRuntime(backend);
   try {
     const manager = await runtime.runPromise(SubagentManager);
     const spawned = await runtime.runPromise(
@@ -996,7 +1187,7 @@ test("a preflight that ignores abort is force-closed without reopening the sessi
     const freshHarness = fixtures.harnesses[1];
     assert.ok(freshHarness);
     await waitFor(() => freshHarness.calls.aborts === 1, "fresh run abort");
-    freshHarness.emit({ type: "agent_settled" });
+    freshHarness.emit({ type: "agent_settled", ...{ aborted: false } });
     freshHarness.resolvePrompt();
     await freshCancellation;
   } finally {
@@ -1060,7 +1251,7 @@ test("prompt and tool cancellation ignore late completion and free capacity", as
     assert.equal(cancellationFinished, false);
     latePrompt.reject(new Error("late prompt rejection"));
     for (const harness of fixtures.harnesses.slice(1)) {
-      harness.emit({ type: "agent_settled" });
+      harness.emit({ type: "agent_settled", ...{ aborted: false } });
       harness.resolvePrompt();
     }
     const report = await cancellation;
@@ -1079,7 +1270,7 @@ test("prompt and tool cancellation ignore late completion and free capacity", as
     assert.ok(toolHarness);
     promptHarness.emit({ type: "agent_start" });
     promptHarness.emitAssistant("late prompt completion");
-    promptHarness.emit({ type: "agent_settled" });
+    promptHarness.emit({ type: "agent_settled", ...{ aborted: false } });
     toolHarness.emit({
       type: "tool_execution_end",
       toolCallId: "tool-2",
@@ -1088,7 +1279,7 @@ test("prompt and tool cancellation ignore late completion and free capacity", as
       isError: false,
     });
     toolHarness.emitAssistant("late tool completion");
-    toolHarness.emit({ type: "agent_settled" });
+    toolHarness.emit({ type: "agent_settled", ...{ aborted: false } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(settlements, 4);
     assert.equal(manager.view.get(spawned[0]!.id)?.finalText, "");
@@ -1110,7 +1301,10 @@ test("prompt and tool cancellation ignore late completion and free capacity", as
       () => afterCancellationHarness.calls.aborts === 1,
       "replacement run abort",
     );
-    afterCancellationHarness.emit({ type: "agent_settled" });
+    afterCancellationHarness.emit({
+      type: "agent_settled",
+      ...{ aborted: false },
+    });
     afterCancellationHarness.resolvePrompt();
     await afterCancellationStop;
   } finally {
@@ -1118,94 +1312,65 @@ test("prompt and tool cancellation ignore late completion and free capacity", as
   }
 });
 
-test("a silent provider is terminalized once, disposed, and releases all slots", async () => {
-  const never = new Promise<void>(() => {});
-  const fixtures = harnessFactory((_options, index) => {
-    if (index >= 4) return {};
-    if (index % 2 === 0) return { shutdown: () => never };
-    return {
-      shutdown: async () => {
-        throw new Error("shutdown fixture failed");
-      },
-      dispose: () => {
-        throw new Error("dispose fixture failed");
-      },
-    };
-  });
-  const backend = makePiBackend({
-    sessionFactory: fixtures.factory,
-    shutdownTimeoutMs: 30,
-  });
-  const runtime = createManagerRuntime(backend, 40);
+test("quiet provider thinking past 45 seconds remains live and can complete", async (t) => {
+  const fixtures = harnessFactory(() => ({}));
+  const runtime = createManagerRuntime(
+    makePiBackend({ sessionFactory: fixtures.factory }),
+  );
   try {
     const manager = await runtime.runPromise(SubagentManager);
-    let settlements = 0;
-    manager.view.setOnSettled(() => settlements++);
-    const stalled = await Promise.all(
-      [0, 1, 2, 3].map((index) =>
-        runtime.runPromise(manager.spawn("pi", task(`silent ${index}`))),
-      ),
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const spawned = await runtime.runPromise(
+      manager.spawn("pi", task("quiet thinking")),
     );
-
-    await assert.rejects(
-      runtime.runPromise(manager.spawn("pi", task("over capacity"))),
-      /Max 4 subagent sessions/,
+    const harness = fixtures.harnesses[0];
+    assert.ok(harness);
+    harness.emit({ type: "agent_start" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(46_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(manager.view.get(spawned.id)?.status, "running");
+    assert.equal(harness.calls.aborts, 0);
+    t.mock.timers.reset();
+    harness.emitAssistant("completed after quiet thinking");
+    harness.emit({ type: "agent_settled", ...{ aborted: false } });
+    harness.resolvePrompt();
+    await runtime.runPromise(manager.waitFor([spawned.id]));
+    assert.equal(manager.view.get(spawned.id)?.status, "done");
+    assert.equal(
+      manager.view.get(spawned.id)?.finalText,
+      "completed after quiet thinking",
     );
-    await runtime.runPromise(
-      manager.waitFor(stalled.map((snapshot) => snapshot.id)),
-    );
-    for (const snapshot of stalled) {
-      const failed = manager.view.get(snapshot.id);
-      assert.equal(failed?.status, "error");
-      assert.match(failed?.errorText ?? "", /no assistant response event/);
-    }
-    assert.equal(settlements, 4);
-    await waitFor(
-      () =>
-        fixtures.harnesses.every((harness) => harness.calls.disposals === 1),
-      "silent sessions to be disposed despite cleanup failures",
-    );
-
-    const late = fixtures.harnesses[0];
-    assert.ok(late);
-    late.emitAssistant("late provider completion");
-    late.emit({ type: "agent_settled" });
-    late.resolvePrompt();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(settlements, 4);
-    assert.equal(manager.view.get(stalled[0]!.id)?.finalText, "");
-
-    const fresh = await runtime.runPromise(
-      manager.spawn("pi", task("fresh after watchdog")),
-    );
-    assert.equal(fresh.status, "running");
-    const freshCancellation = runtime.runPromise(manager.cancel([fresh.id]));
-    const freshHarness = fixtures.harnesses[4];
-    assert.ok(freshHarness);
-    await waitFor(() => freshHarness.calls.aborts === 1, "fresh run abort");
-    freshHarness.emit({ type: "agent_settled" });
-    freshHarness.resolvePrompt();
-    await freshCancellation;
   } finally {
+    t.mock.timers.reset();
     await runtime.dispose();
   }
 });
 
-test("adapter scope cleanup is bounded across shutdown timeouts and failures", async () => {
+test("adapter scope cleanup is bounded across shutdown timeouts and failures", async (t) => {
   const never = new Promise<void>(() => {});
   const timedOutFixtures = harnessFactory(() => ({
     prompt: async () => {},
-    shutdown: () => never,
+    shutdown: () => {
+      // Start the clock at the owned cleanup seam, after resource loading.
+      // Advancing the configured deadline verifies the bound without a wall-
+      // time assertion that also charges unrelated parallel-suite startup.
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      setImmediate(() => t.mock.timers.tick(25));
+      return never;
+    },
   }));
   const timedOutBackend = makePiBackend({
     sessionFactory: timedOutFixtures.factory,
     shutdownTimeoutMs: 25,
   });
-  const timeoutStartedAt = Date.now();
-  await Effect.runPromise(
-    Effect.scoped(timedOutBackend.spawn(task("timeout cleanup"))),
-  );
-  assert.ok(Date.now() - timeoutStartedAt < 500);
+  try {
+    await Effect.runPromise(
+      Effect.scoped(timedOutBackend.spawn(task("timeout cleanup"))),
+    );
+  } finally {
+    t.mock.timers.reset();
+  }
   const timedOutHarness = timedOutFixtures.harnesses[0];
   assert.ok(timedOutHarness);
   assert.equal(timedOutHarness.calls.shutdowns, 1);
@@ -1232,3 +1397,59 @@ test("adapter scope cleanup is bounded across shutdown timeouts and failures", a
   assert.equal(failedHarness.calls.shutdowns, 1);
   assert.equal(failedHarness.calls.disposals, 1);
 });
+
+for (const stage of ["factory", "binding"] as const) {
+  test(`cancelling during child ${stage} disposes late acquisition exactly once`, async () => {
+    const entered = deferred<void>();
+    const gate = deferred<void>();
+    const harness = createPiAgentSessionHarness({
+      model: FIXTURE_MODEL as AgentSession["model"],
+      activeTools: ["read"],
+      shutdown: async () => {},
+      bind:
+        stage === "binding"
+          ? async () => {
+              entered.resolve();
+              await gate.promise;
+            }
+          : undefined,
+    });
+    const backend = makePiBackend({
+      sessionFactory: async () => {
+        if (stage === "factory") {
+          entered.resolve();
+          await gate.promise;
+        }
+        return { session: harness.session };
+      },
+      shutdownTimeoutMs: 50,
+    });
+    const abort = new AbortController();
+    const result = Effect.runPromise(
+      Effect.scoped(backend.spawn(task("cancel acquisition"))),
+      { signal: abort.signal },
+    ).catch(() => undefined);
+    try {
+      await entered.promise;
+      abort.abort();
+      await result;
+      if (stage === "binding") {
+        await waitFor(
+          () => harness.calls.disposals === 1,
+          "cancelled binding cleanup",
+        );
+      }
+      gate.resolve();
+      await waitFor(() => harness.calls.disposals === 1, "late child cleanup");
+      assert.equal(harness.calls.bindings.length, stage === "factory" ? 0 : 1);
+      assert.equal(harness.calls.aborts, 1);
+      assert.equal(harness.calls.shutdowns, 1);
+      assert.equal(harness.calls.disposals, 1);
+      assert.deepEqual(harness.calls.prompts, []);
+    } finally {
+      abort.abort();
+      gate.resolve();
+      await result;
+    }
+  });
+}

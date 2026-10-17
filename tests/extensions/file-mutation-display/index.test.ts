@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { toolExecutionContext } from "../../support/extension-tool-context.ts";
 import { stripVTControlCharacters } from "node:util";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -20,6 +21,7 @@ import {
   ToolExecutionComponent,
   type ExtensionContext,
   type Theme,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import fileMutationDisplay from "../../../extensions/file-mutation-display/index.ts";
@@ -54,7 +56,7 @@ async function withSession(
     sessionManager: SessionManager.inMemory(cwd),
   });
   try {
-    await session.bindExtensions({ mode: "print" });
+    await session.bindExtensions({ mode: "tui" });
     await run(session, cwd);
   } finally {
     session.dispose();
@@ -64,6 +66,22 @@ async function withSession(
 
 test("overrides all seven activity renderers without changing model-facing definitions", async () => {
   await withSession(async (session, cwd) => {
+    type Presentation = Pick<
+      ToolDefinition,
+      "renderCall" | "renderResult" | "renderShell"
+    >;
+    const runner = session.extensionRunner as typeof session.extensionRunner & {
+      resolveToolRenderers?: (
+        name: string,
+        base: () => Presentation | undefined,
+      ) => Presentation | undefined;
+    };
+    const presentation = (name: string) => {
+      const definition = session.getToolDefinition(name);
+      return runner.resolveToolRenderers
+        ? runner.resolveToolRenderers(name, () => definition)
+        : definition;
+    };
     const native = Object.fromEntries(
       [
         createBashToolDefinition(cwd),
@@ -81,7 +99,7 @@ test("overrides all seven activity renderers without changing model-facing defin
       const expected = native[name];
       assert.ok(actual, name);
       assert.ok(expected, name);
-      assert.equal(actual.renderShell, "self", name);
+      assert.equal(presentation(name)?.renderShell, "self", name);
       assert.equal(actual.name, expected.name, name);
       assert.equal(actual.label, expected.label, name);
       assert.equal(actual.description, expected.description, name);
@@ -98,7 +116,7 @@ test("overrides all seven activity renderers without changing model-facing defin
     const write = session.getToolDefinition("write");
     const edit = session.getToolDefinition("edit");
 
-    const renderWrite = write?.renderCall;
+    const renderWrite = presentation("write")?.renderCall;
     assert.ok(renderWrite);
     const identityTheme = new Proxy(
       {},
@@ -120,6 +138,8 @@ test("overrides all seven activity renderers without changing model-facing defin
       toolCallId: "write-render",
       invalidate() {},
       lastComponent: undefined,
+      ...{ durationMs: undefined },
+      ...{ outputPad: 0 },
       state: {},
       cwd,
       executionStarted: false,
@@ -153,7 +173,7 @@ test("overrides all seven activity renderers without changing model-facing defin
       { command: "printf native-bash" },
       undefined,
       undefined,
-      ctx,
+      toolExecutionContext(ctx),
     );
     assert.equal(bashResult.content[0]?.type, "text");
     assert.match(
@@ -165,7 +185,7 @@ test("overrides all seven activity renderers without changing model-facing defin
       { path: "fixture.txt", content: "before\n" },
       undefined,
       undefined,
-      ctx,
+      toolExecutionContext(ctx),
     );
     await edit!.execute(
       "edit-1",
@@ -175,7 +195,7 @@ test("overrides all seven activity renderers without changing model-facing defin
       },
       undefined,
       undefined,
-      ctx,
+      toolExecutionContext(ctx),
     );
     assert.equal(
       await readFile(path.join(cwd, "fixture.txt"), "utf8"),
@@ -221,4 +241,57 @@ test("real ToolExecutionComponent toggles between one activity row and native ev
 
   component.setExpanded(false);
   assert.equal(nonEmpty().length, 1);
+});
+
+test("native grep on a newline-containing filename keeps collapsed rows physical", async () => {
+  if (process.platform === "win32") return;
+  const cwd = await mkdtemp(path.join(tmpdir(), "pi-newline-label-"));
+  try {
+    const args = { pattern: "alpha", path: "合法\nfile.txt" };
+    await writeFile(path.join(cwd, args.path), "alpha\nbeta\n");
+    const native = createGrepToolDefinition(cwd);
+    const result = await native.execute(
+      "newline-path",
+      args,
+      undefined,
+      undefined,
+      toolExecutionContext({ cwd } as ExtensionContext),
+    );
+    const evidence = JSON.stringify({ args, result });
+    const makeComponent = (definition: typeof native) => {
+      const component = new ToolExecutionComponent(
+        "grep",
+        "newline-path",
+        args,
+        { showImages: false },
+        definition,
+        { requestRender() {} } as unknown as TUI,
+        cwd,
+      );
+      component.markExecutionStarted();
+      component.setArgsComplete();
+      component.updateResult({ ...result, isError: false });
+      return component;
+    };
+    const component = makeComponent(withActivityRenderer(native));
+    const collapsed = component.render(100).filter((line) => line.trim());
+    assert.equal(collapsed.length, 1);
+    assert.doesNotMatch(collapsed[0]!, /[\r\n]/);
+    assert.match(stripVTControlCharacters(collapsed[0]!), /合法 ↵ file.txt/);
+    const expandedText = (value: ToolExecutionComponent) => {
+      value.setExpanded(true);
+      return value
+        .render(100)
+        .map((line) => stripVTControlCharacters(line).trim())
+        .filter(Boolean);
+    };
+    assert.deepEqual(
+      expandedText(component),
+      expandedText(makeComponent(native)),
+    );
+    assert.equal(JSON.stringify({ args, result }), evidence);
+    assert.match(evidence, /合法\\nfile.txt:1: alpha/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });

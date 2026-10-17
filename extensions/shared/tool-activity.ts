@@ -208,7 +208,7 @@ function pendingVerb(name: string) {
   }
 }
 
-function activityIcon(name: string) {
+export function toolActivityIcon(name: string) {
   switch (canonicalName(name)) {
     case "read":
       return "\ueaa4";
@@ -297,7 +297,7 @@ export function toolActivityText(
   }
   if (duration) parts.push(theme.fg("dim", duration));
   const detail = parts.join(theme.fg("dim", " · "));
-  return `${theme.fg("dim", activityIcon(activity.name))} ${verb} ${theme.fg("muted", row.target)}${detail ? `  ${detail}` : ""}`;
+  return `${theme.fg("dim", toolActivityIcon(activity.name))} ${verb} ${theme.fg("muted", row.target)}${detail ? `  ${detail}` : ""}`;
 }
 
 export function renderToolActivityLine(
@@ -308,7 +308,8 @@ export function renderToolActivityLine(
 ) {
   const ellipsis = activity.status === "success" ? theme.fg("muted", "…") : "…";
   return truncateToWidth(
-    toolActivityText(activity, theme, now),
+    // Native paths may contain newlines; only the collapsed projection is one row.
+    toolActivityText(activity, theme, now).replace(/\r?\n/g, " ↵ "),
     width,
     ellipsis,
   );

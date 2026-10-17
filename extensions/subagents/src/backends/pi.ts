@@ -12,6 +12,7 @@
  *   the child session_shutdown hook and disposes the session.
  */
 
+import { createHash } from "node:crypto";
 import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import type {
   AgentSession,
@@ -19,10 +20,31 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
+  getAgentDir,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
+import { createAgentToolRenderLedger } from "../../../shared/agent-tool-renderer.ts";
+import {
+  bindChildSessionExtensions,
+  CHILD_SHUTDOWN_TIMEOUT_MS,
+  childToolPolicy,
+  createChildResources,
+  shutdownAndDisposeChildSession,
+} from "../../../shared/child-session.ts";
+import {
+  childToolsWithStructuredOutput,
+  createStructuredOutputTool,
+  type EncodedStructuredResult,
+  encodeStructuredResult,
+  STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION,
+} from "../../../shared/structured-output.ts";
+import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
+import {
+  formatWorktreeCleanupWarning,
+  reclaimWorktree,
+} from "../../../shared/worktree.ts";
 import { resolveAgentModel } from "../agent-types.ts";
 import type {
   SubagentBackend,
@@ -36,19 +58,8 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
-import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
-import {
-  bindChildSessionExtensions,
-  CHILD_SHUTDOWN_TIMEOUT_MS,
-  childToolPolicy,
-  createChildResources,
-  shutdownAndDisposeChildSession,
-} from "../../../shared/child-session.ts";
-import {
-  formatWorktreeCleanupWarning,
-  reclaimWorktree,
-} from "../../../shared/worktree.ts";
-import { AgentToolRenderLedger } from "../../../shared/agent-tool-renderer.ts";
+import { persistStructuredResultArtifact } from "../result-artifact.ts";
+import { toolPreview } from "./tool-preview.ts";
 
 const DIRECT_WORKTREE_CLEANUP_TIMEOUT_MS = 4_000;
 const PARTIAL_TEXT_MAX_LENGTH = 128 * 1_024;
@@ -107,27 +118,6 @@ function safeJson(value: unknown): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** First non-empty line of a tool result-ish value (v1 liveToolPreview). */
-function toolPreview(value: unknown): string | undefined {
-  if (typeof value === "string") {
-    return value
-      .split("\n")
-      .find((line) => line.trim())
-      ?.trim();
-  }
-  if (!value || typeof value !== "object") return undefined;
-  const content = (value as { content?: unknown }).content;
-  if (!Array.isArray(content)) return undefined;
-  for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const record = part as { type?: unknown; text?: unknown };
-    if (record.type !== "text" || typeof record.text !== "string") continue;
-    const firstLine = record.text.split("\n").find((line) => line.trim());
-    if (firstLine) return firstLine.trim();
-  }
-  return undefined;
 }
 
 function assistantParts(msg: AssistantMessage): TranscriptPart[] {
@@ -198,46 +188,112 @@ const makePiSession = (
     const thinkingLevel = (task.reasoningEffort ??
       task.parent.inheritedThinkingLevel) as ThinkingLevel | undefined;
 
-    const session = yield* Effect.tryPromise({
-      try: async () => {
-        const { loader, settingsManager } = await createChildResources({
-          cwd: task.cwd,
-          projectTrusted: task.parent.projectTrusted,
-          ...(task.appendSystemPrompt
-            ? { appendSystemPrompt: [...task.appendSystemPrompt] }
-            : {}),
-        });
-        const { session } = await (
-          options.sessionFactory ?? createAgentSession
-        )({
-          cwd: task.cwd,
-          sessionManager: SessionManager.create(task.cwd),
-          settingsManager,
-          resourceLoader: loader,
-          model,
-          thinkingLevel,
-          ...childToolPolicy(task.tools),
-        });
-        // Start child extension session hooks/resources in headless mode.
-        // A rejection here would otherwise leak the freshly created session:
-        // the scope finalizer that owns cleanup is only registered later.
-        try {
-          await bindChildSessionExtensions(session, task.tools);
-        } catch (error) {
-          await shutdownAndDisposeChildSession(session, {
-            timeoutMs: options.shutdownTimeoutMs,
+    let capturedStructured: EncodedStructuredResult | undefined;
+    const structuredOutputTool =
+      task.outputSchema === undefined
+        ? undefined
+        : createStructuredOutputTool(task.outputSchema, (value) => {
+            capturedStructured = encodeStructuredResult(value);
           });
+
+    // Own the session before asynchronous startup. Interruption can happen
+    // before the normal backend finalizer has been installed.
+    let acquiringSession: AgentSession | undefined;
+    let startupOwned = true;
+    const cleanupStartup = () =>
+      acquiringSession
+        ? shutdownAndDisposeChildSession(acquiringSession, {
+            abort: true,
+            timeoutMs: options.shutdownTimeoutMs,
+          })
+        : Promise.resolve();
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(async () => {
+        if (startupOwned) await cleanupStartup();
+      }),
+    );
+
+    const session = yield* Effect.tryPromise({
+      try: async (signal) => {
+        const checkCancelled = () => {
+          if (signal.aborted)
+            throw signal.reason ?? new Error("Subagent startup cancelled");
+        };
+        const onCancelled = () => {
+          void cleanupStartup().catch(() => {});
+        };
+        signal.addEventListener("abort", onCancelled, { once: true });
+        try {
+          checkCancelled();
+          const appendSystemPrompt = [
+            ...(task.appendSystemPrompt ?? []),
+            ...(structuredOutputTool
+              ? [STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION]
+              : []),
+          ];
+          const { loader, settingsManager } = await createChildResources({
+            cwd: task.cwd,
+            projectTrusted: task.parent.projectTrusted,
+            ...(appendSystemPrompt.length > 0 ? { appendSystemPrompt } : {}),
+          });
+          checkCancelled();
+          const { session } = await (
+            options.sessionFactory ?? createAgentSession
+          )({
+            cwd: task.cwd,
+            sessionManager:
+              task.origin === "btw"
+                ? SessionManager.inMemory(task.cwd)
+                : SessionManager.create(task.cwd),
+            settingsManager,
+            resourceLoader: loader,
+            model,
+            thinkingLevel,
+            ...(structuredOutputTool
+              ? { customTools: [structuredOutputTool] }
+              : {}),
+            ...childToolPolicy(
+              childToolsWithStructuredOutput(
+                task.tools,
+                structuredOutputTool !== undefined,
+              ),
+            ),
+          });
+          acquiringSession = session;
+          checkCancelled();
+          // Never start extension binding for a factory that completed after
+          // cancellation. Already-running hooks retain bounded cleanup ownership.
+          await bindChildSessionExtensions(
+            session,
+            childToolsWithStructuredOutput(
+              task.tools,
+              structuredOutputTool !== undefined,
+            ),
+            // `task.tools` is projected from the parent's live surface, so a
+            // name the child cannot expose narrows the child instead of
+            // failing the spawn.
+            { tolerateInheritedMisses: task.inheritedTools === true },
+          );
+          checkCancelled();
+          return session;
+        } catch (error) {
+          await cleanupStartup();
           throw error;
+        } finally {
+          signal.removeEventListener("abort", onCancelled);
         }
-        return session;
       },
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
 
+    let generation = 0;
     interface ActivePrompt {
+      generation: number;
+      startEntryId: string | null;
       cancelled: boolean;
       lifecycleStarted: boolean;
       lifecycleSettled: boolean;
+      lifecycleAborted: boolean;
       promptSettled: boolean;
       promptError?: string;
       lastAssistant?: AssistantMessage;
@@ -271,7 +327,7 @@ const makePiSession = (
 
     const toolTimeout = createToolCallTimeoutGuard();
     toolTimeout.apply(session);
-    const toolRenderer = new AgentToolRenderLedger();
+    const toolRenderer = createAgentToolRenderLedger(session);
 
     const activeModel = (): Model<any> | undefined => {
       const sessionModel = session.model;
@@ -310,6 +366,39 @@ const makePiSession = (
       });
     };
 
+    const evidenceFor = (
+      prompt: ActivePrompt,
+      structured: {
+        status: "saved" | "failed" | "not-run";
+        path?: string;
+        digest?: string;
+      } = { status: "not-run" },
+    ) => {
+      const manager = session.sessionManager;
+      const branch = manager.getBranch?.() ?? [];
+      const final = [...branch]
+        .reverse()
+        .find(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            entry.message === prompt.lastAssistant,
+        );
+      return {
+        generation: prompt.generation,
+        sessionId: manager.getSessionId?.() ?? "",
+        sessionPath: session.sessionFile,
+        sessionPersistence: "unknown" as const,
+        startEntryId: prompt.startEntryId,
+        endEntryId: manager.getLeafId?.() ?? null,
+        finalEntryId: final?.id,
+        parentSessionId: task.parent.sessionId,
+        parentOriginEntryId: task.parent.originEntryId,
+        sealed: prompt.promptSettled,
+        structured,
+      };
+    };
+
     const settle = (prompt = state.activePrompt) => {
       if (!prompt || state.activePrompt !== prompt || state.settled) return;
       state.settled = true;
@@ -317,12 +406,13 @@ const makePiSession = (
       const partialText = prompt.liveText || prompt.finalText || undefined;
       const errorText =
         prompt.promptError ??
-        (last?.stopReason === "error"
+        (!prompt.lifecycleAborted && last?.stopReason === "error"
           ? (last.errorMessage ?? "Run failed")
           : undefined);
       if (errorText !== undefined) {
         emit({
           _tag: "RunSettled",
+          evidence: evidenceFor(prompt),
           outcome: {
             _tag: "Failed",
             errorText: boundedError(errorText),
@@ -331,18 +421,62 @@ const makePiSession = (
         });
         return;
       }
-      if (last?.stopReason === "aborted") {
+      if (prompt.lifecycleAborted || last?.stopReason === "aborted") {
         emit({
           _tag: "RunSettled",
+          evidence: evidenceFor(prompt),
           outcome: { _tag: "Interrupted", partialText },
         });
         return;
       }
+      if (task.outputSchema !== undefined && capturedStructured === undefined) {
+        emit({
+          _tag: "RunSettled",
+          evidence: evidenceFor(prompt),
+          outcome: {
+            _tag: "Failed",
+            errorText:
+              "Agent finished without calling structured_output; no structured result matching output_schema was produced.",
+            partialText,
+          },
+        });
+        return;
+      }
+      let structuredResult;
+      let structuredPersistence: "saved" | "failed" | "not-run" = "not-run";
+      if (capturedStructured) {
+        try {
+          structuredResult = {
+            ...capturedStructured,
+            artifactPath: persistStructuredResultArtifact(
+              getAgentDir(),
+              capturedStructured.json,
+            ),
+          };
+          structuredPersistence = "saved";
+        } catch {
+          // Execution succeeded; saving its evidence did not. Do not recast
+          // that storage failure as a failed model execution.
+          structuredPersistence = "failed";
+        }
+      }
       emit({
         _tag: "RunSettled",
+        evidence: evidenceFor(prompt, {
+          status: structuredPersistence,
+          ...(structuredResult
+            ? {
+                path: structuredResult.artifactPath,
+                digest: createHash("sha256")
+                  .update(structuredResult.json)
+                  .digest("hex"),
+              }
+            : {}),
+        }),
         outcome: {
           _tag: "Completed",
           finalText: prompt.finalText,
+          ...(structuredResult ? { structuredResult } : {}),
         },
       });
     };
@@ -403,7 +537,7 @@ const makePiSession = (
           // Extensions may register tools between runs; guard new ones too.
           toolTimeout.apply(session);
           activePrompt.lifecycleStarted = true;
-          emit({ _tag: "RunStarted" });
+          // Retries may emit agent_start again inside this same prompt lease.
           break;
         case "message_update": {
           const streamEvent = event.assistantMessageEvent;
@@ -505,6 +639,8 @@ const makePiSession = (
           break;
         case "agent_settled":
           activePrompt.lifecycleSettled = true;
+          activePrompt.lifecycleAborted ||=
+            "aborted" in event && event.aborted === true;
           maybeSettle(activePrompt);
           break;
       }
@@ -580,6 +716,8 @@ const makePiSession = (
       }),
     );
 
+    startupOwned = false;
+
     /** Start a fresh run (v1 manager.run): fire-and-forget, errors -> events. */
     const startRun = (text: string) => {
       if (state.activePrompt) {
@@ -588,17 +726,21 @@ const makePiSession = (
         );
       }
       const activePrompt: ActivePrompt = {
+        generation: ++generation,
+        startEntryId: session.sessionManager.getLeafId?.() ?? null,
         cancelled: false,
         lifecycleStarted: false,
         lifecycleSettled: false,
+        lifecycleAborted: false,
         promptSettled: false,
         finalText: "",
         liveText: "",
         promise: Promise.resolve(),
       };
       state.activePrompt = activePrompt;
+      capturedStructured = undefined;
       state.settled = false;
-      emit({ _tag: "RunStarted" });
+      emit({ _tag: "RunStarted", generation: activePrompt.generation });
       let prompt: Promise<void>;
       try {
         prompt = session.prompt(text, {
@@ -776,13 +918,18 @@ const makePiSession = (
             state.pendingRestart = undefined;
           }
           state.settled = true;
-          emit({ _tag: "RunSettled", outcome: { _tag: "Interrupted" } });
+          emit({
+            _tag: "RunSettled",
+            notStarted: true,
+            outcome: { _tag: "Interrupted" },
+          });
           return;
         }
         if (!state.closed && !state.settled) {
           state.settled = true;
           emit({
             _tag: "RunSettled",
+            ...(activePrompt ? { evidence: evidenceFor(activePrompt) } : {}),
             outcome: {
               _tag: "Interrupted",
               partialText: activePrompt?.partialTextAtCancel,
